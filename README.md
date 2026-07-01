@@ -64,7 +64,7 @@ python -m app.gui
 - Browse saved sources (text removed) from standalone imports or full Create runs
 - **Use in Create** skips download & inpainting — remix instantly with a new song
 
-### Studio tab
+### Tweaker tab
 - Select any finished edit and tweak overlay settings (position, font, size, stroke)
 - **Re-render Edit** applies changes without re-running inpainting
 
@@ -83,7 +83,7 @@ TikTok URL → download (best quality)
           → replace audio track
           → Whisper lyrics + matched font overlay
           → H.264 CRF 17 export
-          → saved to Songs / Sources / Studio libraries
+          → saved to Songs / Sources / Tweaker libraries
 ```
 
 ## Tips

@@ -281,9 +281,11 @@ def render_studio_preview_frame(
     width: int,
     height: int,
     tweak: OverlayTweak | None = None,
+    *,
+    override_text: str | None = None,
 ) -> np.ndarray:
     """Draw the active caption onto a single BGR frame for live studio preview."""
-    text = _active_lyric(time_sec, lyrics)
+    text = override_text if override_text is not None else _active_lyric(time_sec, lyrics)
     if not text:
         return frame
     return _draw_lyric_on_frame(frame, text, style, width, height, tweak=tweak)

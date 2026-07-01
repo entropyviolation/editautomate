@@ -10,7 +10,7 @@ import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import colorchooser, filedialog, messagebox, simpledialog
 
 import customtkinter as ctk
 
@@ -65,7 +65,23 @@ class QueuedSource:
     result: object | None = None
     widgets: dict = field(default_factory=dict)
 
+
+def _rgb_to_hex(rgb: tuple[int, int, int]) -> str:
+    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+
+
+def _hex_to_rgb(value: str) -> tuple[int, int, int] | None:
+    cleaned = value.strip().lstrip("#")
+    if len(cleaned) != 6:
+        return None
+    try:
+        return (int(cleaned[0:2], 16), int(cleaned[2:4], 16), int(cleaned[4:6], 16))
+    except ValueError:
+        return None
+
+
 # Studio dark palette
+FOXTIDE_EASTER_EGG = "allie loves foxtide"
 BG = "#08080e"
 SURFACE = "#12121a"
 SURFACE_RAISED = "#1a1a26"
@@ -103,7 +119,7 @@ class EditAutomateApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
 
-        self.title("EditAutomate — TikTok Remix Studio")
+        self.title("EditAutomate — TikTok Remix Tweaker")
         self.geometry("1020x860")
         self.minsize(900, 720)
         self.configure(fg_color=BG)
@@ -267,6 +283,12 @@ class EditAutomateApp(ctk.CTk):
         title_row.grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(title_row, text="Edit", font=ctk.CTkFont(size=28, weight="bold"), text_color=TEXT).pack(side="left")
         ctk.CTkLabel(title_row, text="Automate", font=ctk.CTkFont(size=28, weight="bold"), text_color=ACCENT).pack(side="left")
+        ctk.CTkLabel(
+            title_row,
+            text=FOXTIDE_EASTER_EGG,
+            font=ctk.CTkFont(size=10),
+            text_color=TEXT_DIM,
+        ).pack(side="left", padx=(14, 0), pady=(10, 0))
 
         chips = ctk.CTkFrame(header, fg_color="transparent")
         chips.grid(row=1, column=0, sticky="w", pady=(4, 0))
@@ -289,7 +311,7 @@ class EditAutomateApp(ctk.CTk):
         self.tabs.add("Create")
         self.tabs.add("Songs")
         self.tabs.add("Sources")
-        self.tabs.add("Studio")
+        self.tabs.add("Tweaker")
 
         self._build_create_tab()
         self._build_songs_tab()
@@ -321,7 +343,7 @@ class EditAutomateApp(ctk.CTk):
             self._pipeline_chip(flow, step).pack(side="left")
         ctk.CTkLabel(
             flow,
-            text="9:16 · 15–60s",
+            text="9:16 · 15–60s · " + FOXTIDE_EASTER_EGG,
             font=ctk.CTkFont(size=10),
             text_color=TEXT_MUTED,
         ).pack(side="left", padx=(10, 0))
@@ -434,7 +456,7 @@ class EditAutomateApp(ctk.CTk):
         self.queue_frame.grid(row=5, column=0, sticky="ew", pady=(4, 8))
         self._queue_empty_label = ctk.CTkLabel(
             self.queue_frame,
-            text="Batch jobs appear here — Generate starts immediately",
+            text=f"Batch jobs appear here — Generate starts immediately ({FOXTIDE_EASTER_EGG})",
             text_color=TEXT_DIM,
             font=ctk.CTkFont(size=11),
         )
@@ -453,6 +475,12 @@ class EditAutomateApp(ctk.CTk):
         hdr = ctk.CTkFrame(left, fg_color="transparent")
         hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
         ctk.CTkLabel(hdr, text="Your Songs", font=ctk.CTkFont(size=14, weight="bold"), text_color=TEXT).pack(side="left")
+        ctk.CTkLabel(
+            hdr,
+            text=FOXTIDE_EASTER_EGG,
+            font=ctk.CTkFont(size=10),
+            text_color=TEXT_DIM,
+        ).pack(side="left", padx=(10, 0), pady=(2, 0))
         self._outline_btn(hdr, "+ Upload", self._upload_song, width=90).pack(side="right")
 
         self.songs_list = self._list_panel(left, fg_color=SURFACE)
@@ -536,7 +564,7 @@ class EditAutomateApp(ctk.CTk):
         hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 0))
         ctk.CTkLabel(
             hdr,
-            text="Inpainted source files — TikTok edits with text removed, ready to remix",
+            text="Inpainted source files — TikTok edits with text removed, ready to remix · " + FOXTIDE_EASTER_EGG,
             font=ctk.CTkFont(size=13),
             text_color=TEXT_MUTED,
         ).pack(side="left")
@@ -598,7 +626,7 @@ class EditAutomateApp(ctk.CTk):
         self.source_jobs_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
         self._source_jobs_empty_label = ctk.CTkLabel(
             self.source_jobs_frame,
-            text="Paste a link and hit Download — add as many as you want in parallel.",
+            text=f"Paste a link and hit Download — {FOXTIDE_EASTER_EGG}",
             text_color=TEXT_DIM,
             font=ctk.CTkFont(size=11),
         )
@@ -644,17 +672,17 @@ class EditAutomateApp(ctk.CTk):
         self._outline_btn(preview_actions, "Reveal in Finder", self._reveal_preview_source, width=130).pack(side="left")
 
     def _build_studio_tab(self) -> None:
-        tab = self._scrollable_tab("Studio")
+        tab = self._scrollable_tab("Tweaker")
         tab.grid_columnconfigure(0, weight=1)
 
         top = ctk.CTkFrame(tab, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
         top.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(top, text="Studio", font=ctk.CTkFont(size=18, weight="bold"), text_color=TEXT).grid(
+        ctk.CTkLabel(top, text="Tweaker", font=ctk.CTkFont(size=18, weight="bold"), text_color=TEXT).grid(
             row=0, column=0, sticky="w",
         )
         self.studio_title = ctk.CTkLabel(
-            top, text="Select a project to edit captions", font=ctk.CTkFont(size=13), text_color=TEXT_MUTED, anchor="w",
+            top, text="Select a project to tweak captions", font=ctk.CTkFont(size=13), text_color=TEXT_MUTED, anchor="w",
         )
         self.studio_title.grid(row=0, column=1, sticky="ew", padx=(12, 0))
         actions = ctk.CTkFrame(top, fg_color="transparent")
@@ -707,6 +735,7 @@ class EditAutomateApp(ctk.CTk):
         self.studio_caption_text = self._styled_entry(editor, placeholder_text="Caption text…")
         self.studio_caption_text.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 14), pady=4)
         self.studio_caption_text.bind("<KeyRelease>", lambda _e: self._studio_caption_text_changed())
+        self.studio_caption_text.bind("<Key>", lambda _e: self.after_idle(self._studio_caption_text_changed))
 
         timing = ctk.CTkFrame(editor, fg_color=SURFACE_RAISED, corner_radius=8)
         timing.grid(row=2, column=0, columnspan=3, sticky="ew", padx=14, pady=(4, 12))
@@ -768,6 +797,22 @@ class EditAutomateApp(ctk.CTk):
         self.tweak_font.configure(command=lambda _v: self._studio_style_changed())
         row += 1
 
+        ctk.CTkLabel(style, text="Color", font=ctk.CTkFont(size=12), text_color=TEXT_MUTED).grid(
+            row=row, column=0, sticky="w", padx=14, pady=5,
+        )
+        color_row = ctk.CTkFrame(style, fg_color="transparent")
+        color_row.grid(row=row, column=1, columnspan=2, sticky="ew", padx=14, pady=5)
+        color_row.grid_columnconfigure(0, weight=1)
+        self.tweak_color = self._styled_entry(color_row, placeholder_text="#ffffff")
+        self.tweak_color.grid(row=0, column=0, sticky="ew")
+        self.tweak_color.bind("<KeyRelease>", lambda _e: self._tweak_color_changed())
+        self.tweak_color_swatch = ctk.CTkLabel(
+            color_row, text="", width=32, height=32, corner_radius=6, fg_color="#ffffff",
+        )
+        self.tweak_color_swatch.grid(row=0, column=1, padx=(8, 4))
+        self._outline_btn(color_row, "Pick…", self._pick_tweak_color, width=58).grid(row=0, column=2)
+        row += 1
+
         self.tweak_stroke_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
             style, text="Text outline", variable=self.tweak_stroke_var,
@@ -790,7 +835,7 @@ class EditAutomateApp(ctk.CTk):
         self._outline_btn(tl_tools, "Delete", self._studio_delete_caption, width=80).pack(side="left")
         ctk.CTkLabel(
             tl_tools,
-            text="Preview shows captions on video · drag timeline blocks to move or trim",
+            text=f"Preview shows captions on video · {FOXTIDE_EASTER_EGG}",
             font=ctk.CTkFont(size=11),
             text_color=TEXT_DIM,
         ).pack(side="right")
@@ -823,9 +868,15 @@ class EditAutomateApp(ctk.CTk):
             footer, height=72, font=ctk.CTkFont(family="Menlo", size=11),
             fg_color=LOG_BG, text_color=TEXT_MUTED, corner_radius=8, border_width=1, border_color=BORDER,
         )
-        self.log_box.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 14))
+        self.log_box.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 6))
         self.log_box.configure(state="disabled")
-        self._log("Welcome! Songs tab → pick snippet & lyrics → Create → Generate Edit.")
+        ctk.CTkLabel(
+            footer,
+            text=FOXTIDE_EASTER_EGG,
+            font=ctk.CTkFont(size=9),
+            text_color=TEXT_DIM,
+        ).grid(row=3, column=0, sticky="e", padx=20, pady=(0, 10))
+        self._log(f"Welcome! Songs → snippet & lyrics → Create → Generate. ({FOXTIDE_EASTER_EGG})")
 
     # --- Logging / progress ---
 
@@ -925,7 +976,7 @@ class EditAutomateApp(ctk.CTk):
             w.destroy()
         songs = self._library.list_songs()
         if not songs:
-            ctk.CTkLabel(self.songs_list, text="No songs yet — upload one!", text_color=TEXT_DIM).pack(pady=20)
+            ctk.CTkLabel(self.songs_list, text=f"No songs yet — upload one! ({FOXTIDE_EASTER_EGG})", text_color=TEXT_DIM).pack(pady=20)
             return
         for song in songs:
             btn = ctk.CTkButton(
@@ -1466,7 +1517,38 @@ class EditAutomateApp(ctk.CTk):
         self.tabs.set("Create")
         self._log(f"Using source '{src.title}' — will skip download & inpainting")
 
-    # --- Studio tab ---
+    # --- Tweaker tab ---
+
+    def _tweak_color_rgb(self) -> tuple[int, int, int] | None:
+        return _hex_to_rgb(self.tweak_color.get())
+
+    def _set_tweak_color_ui(self, rgb: tuple[int, int, int] | None) -> None:
+        self._studio_syncing = True
+        if rgb:
+            hex_val = _rgb_to_hex(rgb)
+            self.tweak_color.delete(0, "end")
+            self.tweak_color.insert(0, hex_val)
+            self.tweak_color_swatch.configure(fg_color=hex_val)
+        else:
+            self.tweak_color.delete(0, "end")
+            self.tweak_color_swatch.configure(fg_color=SURFACE_RAISED)
+        self._studio_syncing = False
+
+    def _tweak_color_changed(self) -> None:
+        if self._studio_syncing:
+            return
+        rgb = _hex_to_rgb(self.tweak_color.get())
+        if rgb:
+            self.tweak_color_swatch.configure(fg_color=_rgb_to_hex(rgb))
+        self._studio_style_changed()
+
+    def _pick_tweak_color(self) -> None:
+        initial = self._tweak_color_rgb() or (255, 255, 255)
+        result = colorchooser.askcolor(color=_rgb_to_hex(initial), title="Caption color")
+        if result and result[0]:
+            r, g, b = int(result[0][0]), int(result[0][1]), int(result[0][2])
+            self._set_tweak_color_ui((r, g, b))
+            self._studio_style_changed()
 
     def _refresh_edits_list(self) -> None:
         edits = self._library.list_edits()
@@ -1531,6 +1613,7 @@ class EditAutomateApp(ctk.CTk):
         self.tweak_stroke_label.configure(text=str(t.stroke_width or edit.font_style.stroke_width))
         self.tweak_font.set(t.font_name or edit.font_style.dominant_font)
         self.tweak_stroke_var.set(t.has_stroke if t.has_stroke is not None else edit.font_style.has_stroke)
+        self._set_tweak_color_ui(t.color or edit.font_style.dominant_color)
 
         playhead = self.studio_timeline.playhead_time()
         self.studio_preview.load(
@@ -1545,9 +1628,16 @@ class EditAutomateApp(ctk.CTk):
 
         idx = self.studio_timeline.selected_index()
         self._fill_studio_caption_fields(idx)
+        self._studio_refresh_preview()
 
     def _studio_style_changed(self, *_args: object) -> None:
         self._studio_refresh_preview()
+
+    def _studio_preview_edit_text(self) -> str | None:
+        idx = self.studio_timeline.selected_index()
+        if idx is None or idx >= len(self._studio_lyrics):
+            return None
+        return self.studio_caption_text.get()
 
     def _studio_refresh_preview(self) -> None:
         if self._studio_font_style is None:
@@ -1557,6 +1647,7 @@ class EditAutomateApp(ctk.CTk):
             self._studio_font_style,
             self._current_tweak(),
         )
+        self.studio_preview.set_editing_caption(self._studio_preview_edit_text())
         self.studio_preview.refresh(immediate=True)
 
     def _on_studio_timeline_seek(self, t: float) -> None:
@@ -1595,6 +1686,13 @@ class EditAutomateApp(ctk.CTk):
 
     def _on_studio_caption_select(self, index: int | None) -> None:
         self._fill_studio_caption_fields(index)
+        if index is not None and index < len(self._studio_lyrics):
+            t = self._studio_lyrics[index].start
+            self._studio_syncing = True
+            self.studio_timeline.set_playhead(t, notify=False)
+            self.studio_preview.set_time(t, notify=False)
+            self._studio_syncing = False
+        self._studio_refresh_preview()
 
     def _on_studio_timeline_change(self, lyrics: list[LyricLine]) -> None:
         if self._studio_syncing:
@@ -1637,7 +1735,7 @@ class EditAutomateApp(ctk.CTk):
 
     def _studio_add_caption(self) -> None:
         if not self._selected_edit_id:
-            messagebox.showinfo("No project", "Create an edit first, then open it in Studio.")
+            messagebox.showinfo("No project", "Create an edit first, then open it in Tweaker.")
             return
         idx = self.studio_timeline.selected_index()
         if idx is not None and idx < len(self._studio_lyrics):
@@ -1676,6 +1774,7 @@ class EditAutomateApp(ctk.CTk):
             offset_y=int(self.tweak_y.get()),
             font_size=int(self.tweak_size.get()),
             font_name=self.tweak_font.get(),
+            color=self._tweak_color_rgb(),
             has_stroke=self.tweak_stroke_var.get(),
             stroke_width=int(self.tweak_stroke.get()),
         )

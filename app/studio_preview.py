@@ -58,15 +58,22 @@ class StudioPreview(ctk.CTkFrame):
         self._playing = False
         self._photo: ImageTk.PhotoImage | None = None
         self._last_frame_size = (0, 0)
+        self._edit_text: str | None = None
 
         hdr = ctk.CTkFrame(self, fg_color="transparent")
         hdr.pack(fill="x", padx=12, pady=(10, 6))
         ctk.CTkLabel(
             hdr,
-            text="PREVIEW",
+            text="VIDEO PREVIEW",
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color=_TEXT_DIM,
         ).pack(side="left")
+        ctk.CTkLabel(
+            hdr,
+            text="Captions render on the frame",
+            font=ctk.CTkFont(size=10),
+            text_color=_TEXT_DIM,
+        ).pack(side="left", padx=(10, 0))
         self.time_label = ctk.CTkLabel(hdr, text="0.0s / 0.0s", font=ctk.CTkFont(size=11), text_color=_TEXT_MUTED)
         self.time_label.pack(side="left", padx=(12, 0))
         self.play_btn = ctk.CTkButton(
@@ -89,7 +96,7 @@ class StudioPreview(ctk.CTkFrame):
         self._frame_host = ctk.CTkFrame(self, fg_color=_BG, corner_radius=8, border_width=1, border_color=_BORDER)
         self._frame_host.pack(fill="both", expand=True, padx=12, pady=(0, 8))
         self._frame_host.pack_propagate(False)
-        self._frame_host.configure(height=420)
+        self._frame_host.configure(height=520)
 
         self.canvas = tk.Canvas(
             self._frame_host,
@@ -115,14 +122,14 @@ class StudioPreview(ctk.CTkFrame):
         info.pack(fill="x", padx=12, pady=(0, 10))
         info.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(info, text="Caption", font=ctk.CTkFont(size=11), text_color=_TEXT_DIM).grid(
-            row=0, column=0, sticky="nw", padx=(12, 8), pady=(10, 4),
+        ctk.CTkLabel(info, text="At playhead", font=ctk.CTkFont(size=11), text_color=_TEXT_DIM).grid(
+            row=0, column=0, sticky="w", padx=(12, 8), pady=(8, 4),
         )
         self.caption_label = ctk.CTkLabel(
             info,
             text="—",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=_TEXT,
+            font=ctk.CTkFont(size=11),
+            text_color=_TEXT_MUTED,
             anchor="w",
             wraplength=520,
             justify="left",
@@ -181,11 +188,17 @@ class StudioPreview(ctk.CTkFrame):
         self._duration = 0.0
         self._time = 0.0
         self._lyrics = []
+        self._edit_text = None
         self.play_btn.configure(state="disabled")
         self._update_info_labels()
         self._clear_image()
         self.canvas.itemconfigure(self._placeholder_id, text="Select a project to preview")
         self._place_frame_image()
+
+    def set_editing_caption(self, text: str | None) -> None:
+        """When set, burn this caption onto the preview frame (unless playing)."""
+        self._edit_text = text
+        self._update_info_labels()
 
     def set_overlay(
         self,
@@ -226,12 +239,34 @@ class StudioPreview(ctk.CTkFrame):
         delay = 0 if immediate else 60
         self._refresh_after_id = self.after(delay, self._do_refresh)
 
+    def _caption_for_render(self) -> str | None:
+        if self._playing:
+            text = active_lyric_at_time(self._time, self._lyrics)
+            return text or None
+        if self._edit_text is not None and self._edit_text.strip():
+            return self._edit_text
+        text = active_lyric_at_time(self._time, self._lyrics)
+        return text or None
+
     def _update_info_labels(self) -> None:
         self.time_label.configure(text=f"{_fmt_time(self._time)} / {_fmt_time(self._duration)}")
-        caption = active_lyric_at_time(self._time, self._lyrics)
-        if caption:
-            shown = caption.replace("\n", " ")
-            self.caption_label.configure(text=shown, text_color=_TEXT)
+        on_frame = self._caption_for_render()
+        at_playhead = active_lyric_at_time(self._time, self._lyrics)
+        if on_frame:
+            shown = on_frame.replace("\n", " ")
+            editing = (
+                not self._playing
+                and self._edit_text is not None
+                and self._edit_text.strip()
+                and (not at_playhead or at_playhead != self._edit_text.strip())
+            )
+            if editing:
+                self.caption_label.configure(
+                    text=f"Editing on preview: {shown}",
+                    text_color=_ACCENT,
+                )
+            else:
+                self.caption_label.configure(text=shown, text_color=_TEXT_MUTED)
         else:
             self.caption_label.configure(text="(no caption at this time)", text_color=_TEXT_DIM)
 
@@ -240,8 +275,10 @@ class StudioPreview(ctk.CTkFrame):
             font = t.font_name or self._style.dominant_font
             size = t.font_size or self._style.dominant_size
             stroke = "on" if (t.has_stroke if t.has_stroke is not None else self._style.has_stroke) else "off"
+            color = t.color or self._style.dominant_color
+            color_hex = f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
             self.style_label.configure(
-                text=f"{font} · {size}px · offset ({t.offset_x}, {t.offset_y}) · outline {stroke}",
+                text=f"{font} · {size}px · {color_hex} · offset ({t.offset_x}, {t.offset_y}) · outline {stroke}",
             )
         else:
             self.style_label.configure(
@@ -264,6 +301,7 @@ class StudioPreview(ctk.CTkFrame):
         lyrics = [LyricLine(text=l.text, start=l.start, end=l.end) for l in self._lyrics]
         style = self._style
         tweak = self._tweak
+        override = self._caption_for_render()
 
         def work() -> None:
             cap = cv2.VideoCapture(str(video_path))
@@ -282,7 +320,16 @@ class StudioPreview(ctk.CTkFrame):
                 self.after(0, lambda: self._show_error(gen))
                 return
             h, w = frame.shape[:2]
-            rendered = render_studio_preview_frame(frame, t, lyrics, style, w, h, tweak=tweak)
+            rendered = render_studio_preview_frame(
+                frame,
+                t,
+                lyrics,
+                style,
+                w,
+                h,
+                tweak=tweak,
+                override_text=override,
+            )
             rgb = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
             pil = Image.fromarray(rgb)
             self.after(0, lambda p=pil, g=gen: self._show_frame(p, g))
