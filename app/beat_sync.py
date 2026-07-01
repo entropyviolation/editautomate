@@ -13,11 +13,15 @@ import numpy as np
 from app.utils import ProgressCallback, default_progress, get_video_info, probe_video, run_ffmpeg
 
 
+BeatSyncMode = str  # "standard" | "beat_drop"
+
+
 @dataclass
 class BeatAnalysis:
     bpm: float
     beats: list[float]
     duration: float
+    beat_drop_time: float | None = None
 
 
 # Reuse beat grids for the same audio file across jobs (keyed by path + mtime).
@@ -36,6 +40,73 @@ def _beat_cache_key(audio_path: Path) -> str:
 def _audio_duration(path: Path) -> float:
     data = probe_video(path)
     return float(data["format"].get("duration", 0))
+
+
+def _normalize_envelope(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return arr
+    lo, hi = float(arr.min()), float(arr.max())
+    if hi - lo < 1e-9:
+        return np.zeros_like(arr)
+    return (arr - lo) / (hi - lo)
+
+
+def detect_beat_drop_time(y: np.ndarray, sr: int, duration: float) -> float | None:
+    """
+    Find the primary beat drop: a sudden rise in bass, RMS, and onset energy.
+    Skips the first ~10% and last ~15% of the track to avoid intro/outro false positives.
+    """
+    if duration < 2.0 or y.size < sr:
+        return None
+
+    import librosa
+
+    hop = 512
+    oenv = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop, aggregate=np.median)
+    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, hop_length=hop, fmax=8000)
+    bass = mel[:24].mean(axis=0)
+
+    times = librosa.frames_to_time(np.arange(len(oenv)), sr=sr, hop_length=hop)
+    oenv_n = _normalize_envelope(oenv)
+    rms_n = _normalize_envelope(rms)
+    bass_n = _normalize_envelope(bass)
+
+    min_len = min(len(oenv_n), len(rms_n), len(bass_n), len(times))
+    if min_len < 8:
+        return None
+
+    oenv_n = oenv_n[:min_len]
+    rms_n = rms_n[:min_len]
+    bass_n = bass_n[:min_len]
+    times = times[:min_len]
+
+    combined = bass_n * 0.40 + rms_n * 0.35 + oenv_n * 0.25
+    window = max(3, int(min_len * 0.025))
+    if window % 2 == 0:
+        window += 1
+    kernel = np.ones(window) / window
+    smoothed = np.convolve(combined, kernel, mode="same")
+    deriv = np.diff(smoothed, prepend=smoothed[0])
+    drop_score = np.clip(deriv, 0.0, None) * 0.55 + combined * 0.45
+
+    min_time = duration * 0.10
+    max_time = duration * 0.85
+    mask = (times >= min_time) & (times <= max_time)
+    if not mask.any():
+        return None
+
+    idx = int(np.argmax(drop_score[mask]))
+    valid = np.where(mask)[0]
+    drop_time = float(times[valid[idx]])
+    return drop_time
+
+
+def _snap_to_nearest_beat(time_sec: float, beats: list[float]) -> float:
+    if not beats:
+        return time_sec
+    return min(beats, key=lambda b: abs(b - time_sec))
 
 
 def _numpy_scalar(value: object, default: float = 0.0) -> float:
@@ -88,7 +159,17 @@ def analyze_audio_beats(
             t += interval
 
     progress(f"Song: {bpm:.0f} BPM, {len(beat_times)} beats", 0.74)
-    result = BeatAnalysis(bpm=bpm, beats=beat_times, duration=duration)
+
+    beat_drop_time: float | None = None
+    try:
+        raw_drop = detect_beat_drop_time(y, sr, duration)
+        if raw_drop is not None:
+            beat_drop_time = _snap_to_nearest_beat(raw_drop, beat_times)
+            progress(f"Beat drop detected at {beat_drop_time:.1f}s", 0.745)
+    except Exception:
+        beat_drop_time = None
+
+    result = BeatAnalysis(bpm=bpm, beats=beat_times, duration=duration, beat_drop_time=beat_drop_time)
     if use_cache:
         _BEAT_CACHE[cache_key] = result
     return result
@@ -380,6 +461,118 @@ def _merge_adjacent_cuts(
     return merged_cuts, merged_scores
 
 
+def _allocate_beat_counts_phase(
+    motion_scores: list[float],
+    v_durations: list[float],
+    n_beats: int,
+    *,
+    slow: bool,
+) -> list[int]:
+    """Allocate beats across segments for one phase (pre- or post-drop)."""
+    n_seg = len(motion_scores)
+    if n_seg == 0:
+        return []
+    if n_beats <= 0:
+        return [0] * n_seg
+    if n_seg == 1:
+        return [n_beats]
+
+    weights: list[float] = []
+    for motion, v_dur in zip(motion_scores, v_durations):
+        calm = 1.0 - motion
+        if slow:
+            # Lingering, cinematic pacing before the drop.
+            weights.append(max(0.12, v_dur * (0.35 + calm * 4.5 + motion * 0.15)))
+        else:
+            # Rapid cuts after the drop — dynamic shots stay on one beat.
+            weights.append(max(0.06, v_dur * (0.15 + calm * 0.45 + motion * 1.8)))
+
+    total_w = sum(weights)
+    raw = [n_beats * w / total_w for w in weights]
+    floor_min = 2 if slow else 1
+    counts = [max(floor_min, int(math.floor(r))) for r in raw]
+
+    remainder = n_beats - sum(counts)
+    ranked = sorted(
+        (
+            (raw[i] - math.floor(raw[i]), (1.0 - motion_scores[i]) if slow else motion_scores[i], i)
+            for i in range(n_seg)
+        ),
+        reverse=True,
+    )
+    for _, _, idx in ranked:
+        if remainder <= 0:
+            break
+        counts[idx] += 1
+        remainder -= 1
+
+    while sum(counts) > n_beats:
+        trim_idx = max(
+            range(n_seg),
+            key=lambda i: (
+                (counts[i] if slow else -counts[i]),
+                counts[i] / max(v_durations[i], 0.04),
+            ),
+        )
+        if counts[trim_idx] <= floor_min:
+            break
+        counts[trim_idx] -= 1
+
+    while sum(counts) < n_beats:
+        add_idx = max(
+            range(n_seg),
+            key=lambda i: (
+                ((1.0 - motion_scores[i]) if slow else motion_scores[i]) * v_durations[i],
+                counts[i],
+            ),
+        )
+        counts[add_idx] += 1
+
+    return counts
+
+
+def _allocate_beat_counts_beat_drop(
+    motion_scores: list[float],
+    v_durations: list[float],
+    n_beats: int,
+    drop_beat_idx: int,
+) -> list[int]:
+    """Slow sequence before the drop, rapid sequence after."""
+    n_seg = len(motion_scores)
+    if n_seg <= 1:
+        return _allocate_beat_counts(motion_scores, v_durations, n_beats)
+
+    drop_beat_idx = int(np.clip(drop_beat_idx, 1, max(1, n_beats - 1)))
+    n_pre = drop_beat_idx
+    n_post = max(1, n_beats - drop_beat_idx)
+
+    drop_ratio = drop_beat_idx / max(n_beats, 1)
+    pre_seg = max(1, min(n_seg - 1, round(n_seg * drop_ratio)))
+
+    pre_counts = _allocate_beat_counts_phase(
+        motion_scores[:pre_seg],
+        v_durations[:pre_seg],
+        n_pre,
+        slow=True,
+    )
+    post_counts = _allocate_beat_counts_phase(
+        motion_scores[pre_seg:],
+        v_durations[pre_seg:],
+        n_post,
+        slow=False,
+    )
+    return pre_counts + post_counts
+
+
+def _drop_beat_index(beats_local: list[float], drop_time: float | None) -> int | None:
+    if drop_time is None or not beats_local:
+        return None
+    for i, beat in enumerate(beats_local):
+        if beat >= drop_time - 0.02:
+            return max(1, i)
+    return max(1, len(beats_local) - 1)
+
+
 def _allocate_beat_counts(
     motion_scores: list[float],
     v_durations: list[float],
@@ -437,6 +630,54 @@ def _allocate_beat_counts(
     return counts
 
 
+@dataclass
+class SegmentTimeMap:
+    """Maps a slice of the working video timeline to the beat-synced output."""
+
+    video_start: float
+    video_end: float
+    output_start: float
+    output_end: float
+
+
+def remap_time_through_sync(t: float, mappings: list[SegmentTimeMap]) -> float | None:
+    for mapping in mappings:
+        if mapping.video_start - 0.02 <= t <= mapping.video_end + 0.02:
+            span = max(mapping.video_end - mapping.video_start, 1e-6)
+            ratio = (t - mapping.video_start) / span
+            out_span = mapping.output_end - mapping.output_start
+            return mapping.output_start + ratio * out_span
+    return None
+
+
+def remap_speech_regions(
+    regions: list,
+    mappings: list[SegmentTimeMap],
+    *,
+    source_duration: float,
+) -> list:
+    """Re-time dialog regions after beat-sync warping."""
+    from app.audio import SpeechRegion
+
+    remapped: list[SpeechRegion] = []
+    for region in regions:
+        if region.end <= 0 or region.start >= source_duration:
+            continue
+        start = remap_time_through_sync(max(0.0, region.start), mappings)
+        end = remap_time_through_sync(min(region.end, source_duration), mappings)
+        if start is None or end is None or end - start < 0.08:
+            continue
+        remapped.append(
+            SpeechRegion(
+                start=start,
+                end=end,
+                text=region.text,
+                is_likely_dialog=region.is_likely_dialog,
+            )
+        )
+    return remapped
+
+
 def sync_video_to_song(
     video_path: Path,
     audio_path: Path,
@@ -445,7 +686,9 @@ def sync_video_to_song(
     progress: ProgressCallback = default_progress,
     snippet_start: float = 0.0,
     snippet_end: float | None = None,
+    beat_sync_mode: BeatSyncMode = "standard",
     beat_analysis: BeatAnalysis | None = None,
+    time_map_out: list[SegmentTimeMap] | None = None,
 ) -> Path:
     """
     Map video scene cuts to song beats within a snippet window.
@@ -507,11 +750,31 @@ def sync_video_to_song(
         return output_path
 
     v_durations = [max(0.04, cuts[i + 1] - cuts[i]) for i in range(n_seg)]
-    beat_counts = _allocate_beat_counts(motion_scores, v_durations, n_beats)
+
+    drop_time_local: float | None = None
+    if song.beat_drop_time is not None and start <= song.beat_drop_time <= end:
+        drop_time_local = song.beat_drop_time - start
+
+    if beat_sync_mode == "beat_drop" and drop_time_local is not None:
+        drop_idx = _drop_beat_index(song_beats_local, drop_time_local)
+        if drop_idx is not None:
+            beat_counts = _allocate_beat_counts_beat_drop(
+                motion_scores, v_durations, n_beats, drop_idx
+            )
+            progress(
+                f"Beat-drop sync: slow until {drop_time_local:.1f}s, rapid after",
+                0.752,
+            )
+        else:
+            beat_counts = _allocate_beat_counts(motion_scores, v_durations, n_beats)
+    else:
+        beat_counts = _allocate_beat_counts(motion_scores, v_durations, n_beats)
 
     progress("Mapping video cuts to song beats…", 0.75)
 
     segment_files: list[Path] = []
+    segment_maps: list[SegmentTimeMap] = []
+    output_cursor = 0.0
     beat_cursor = 0
     for i in range(n_seg):
         beat_span = beat_counts[i]
@@ -528,6 +791,16 @@ def sync_video_to_song(
         v_dur = max(0.04, v_end - v_start)
         s_dur = max(0.04, s_end - s_start)
         speed = v_dur / s_dur
+
+        segment_maps.append(
+            SegmentTimeMap(
+                video_start=v_start,
+                video_end=v_end,
+                output_start=output_cursor,
+                output_end=output_cursor + s_dur,
+            )
+        )
+        output_cursor += s_dur
 
         seg_out = work_dir / f"sync_seg_{i:03d}.mp4"
         vf = _segment_speed_filter(speed)
@@ -587,6 +860,10 @@ def sync_video_to_song(
     list_path.unlink(missing_ok=True)
     for seg in segment_files:
         seg.unlink(missing_ok=True)
+
+    if time_map_out is not None:
+        time_map_out.clear()
+        time_map_out.extend(segment_maps)
 
     progress("Beat-synced video ready", 0.78)
     return output_path

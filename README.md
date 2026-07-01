@@ -68,6 +68,18 @@ python -m app.gui
 - Select any finished edit and tweak overlay settings (position, font, size, stroke)
 - **Re-render Edit** applies changes without re-running inpainting
 
+### Accounts tab
+- **Add Account** opens a browser window to log into TikTok (or paste a `sessionid` cookie)
+- Manage multiple TikTok accounts and refresh logins when sessions expire
+- Pick a finished edit from your library, write a **caption** and **hashtags**, then **Export to TikTok**
+- Upload progress appears in the Accounts tab queue
+
+After installing dependencies, install the Chromium browser for TikTok login/uploads:
+
+```bash
+playwright install chromium
+```
+
 ### Options
 
 - **Beat-sync** — maps video scene cuts to song BPM; loops video when song is longer
@@ -101,3 +113,5 @@ TikTok URL → download (best quality)
 | Slow inpainting | Ensure PyTorch is installed; Apple Silicon and NVIDIA GPUs are used automatically. Shorter clips still process faster. |
 | Wrong font | Install Arial Black / Impact; app tries common TikTok fonts |
 | Download fails | Check URL is public; update yt-dlp: `pip install -U yt-dlp` |
+| TikTok upload fails | Run `playwright install chromium`; log in again from Accounts tab |
+| Session expired | Use **Log In Again** on the account — TikTok sessions last a few weeks |

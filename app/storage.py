@@ -296,14 +296,52 @@ class EditRecord:
         )
 
 
+@dataclass
+class TikTokAccount:
+    id: str
+    label: str
+    username: str
+    session_id: str
+    added_at: str
+    last_export_at: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "username": self.username,
+            "session_id": self.session_id,
+            "added_at": self.added_at,
+            "last_export_at": self.last_export_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> TikTokAccount:
+        return cls(
+            id=d["id"],
+            label=d["label"],
+            username=d.get("username", ""),
+            session_id=d["session_id"],
+            added_at=d["added_at"],
+            last_export_at=d.get("last_export_at"),
+        )
+
+    def display_name(self) -> str:
+        handle = self.username.strip().lstrip("@")
+        if handle:
+            return f"{self.label} (@{handle})"
+        return self.label
+
+
 class Library:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.songs_dir = root / "library" / "songs"
         self.sources_dir = root / "library" / "sources"
         self.edits_dir = root / "library" / "edits"
+        self.accounts_dir = root / "library" / "accounts"
         self.media_dir = root / "library" / "media"
-        for d in (self.songs_dir, self.sources_dir, self.edits_dir, self.media_dir):
+        for d in (self.songs_dir, self.sources_dir, self.edits_dir, self.accounts_dir, self.media_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     def _read_index(self, path: Path) -> list[dict]:
@@ -451,3 +489,34 @@ class Library:
     def delete_edit(self, edit_id: str) -> None:
         items = [d for d in self._read_index(self.edits_dir / "index.json") if d.get("id") != edit_id]
         self._write_index(self.edits_dir / "index.json", items)
+
+    # --- TikTok accounts ---
+
+    def list_accounts(self) -> list[TikTokAccount]:
+        return [TikTokAccount.from_dict(d) for d in self._read_index(self.accounts_dir / "index.json")]
+
+    def get_account(self, account_id: str) -> TikTokAccount | None:
+        return next((a for a in self.list_accounts() if a.id == account_id), None)
+
+    def add_account(self, label: str, session_id: str, username: str = "") -> TikTokAccount:
+        account_id = _new_id()
+        record = TikTokAccount(
+            id=account_id,
+            label=label.strip() or f"Account {account_id[:6]}",
+            username=username.strip().lstrip("@"),
+            session_id=session_id.strip(),
+            added_at=_now_iso(),
+        )
+        items = self._read_index(self.accounts_dir / "index.json")
+        items.insert(0, record.to_dict())
+        self._write_index(self.accounts_dir / "index.json", items)
+        return record
+
+    def update_account(self, record: TikTokAccount) -> None:
+        items = self._read_index(self.accounts_dir / "index.json")
+        items = [record.to_dict() if d.get("id") == record.id else d for d in items]
+        self._write_index(self.accounts_dir / "index.json", items)
+
+    def delete_account(self, account_id: str) -> None:
+        items = [d for d in self._read_index(self.accounts_dir / "index.json") if d.get("id") != account_id]
+        self._write_index(self.accounts_dir / "index.json", items)

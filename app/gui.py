@@ -8,7 +8,7 @@ import threading
 import uuid
 import webbrowser
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog
 
@@ -26,7 +26,8 @@ from app.audio import (
 from app.beat_sync import analyze_audio_beats, extract_audio_snippet
 from app.lyrics_overlay import re_render_edit
 from app.pipeline import PipelineConfig, PipelineResult, SourcePipelineConfig, run_pipeline, run_source_pipeline
-from app.storage import Library, OverlayTweak
+from app.storage import Library, OverlayTweak, TikTokAccount
+from app.tiktok_export import build_post_description, capture_session_via_browser, upload_video
 from app.caption_timeline import CaptionTimeline
 from app.studio_preview import StudioPreview
 from app.video_preview import VideoPreview
@@ -48,6 +49,22 @@ class QueuedEdit:
     error: str | None = None
     result: PipelineResult | None = None
     widgets: dict = field(default_factory=dict)  # row widgets for live progress updates
+
+
+@dataclass
+class QueuedUpload:
+    """Background Accounts-tab TikTok export job."""
+
+    id: str
+    edit_id: str
+    account_id: str
+    edit_title: str
+    account_label: str
+    status: str = "running"
+    step: str = "Starting…"
+    fraction: float = 0.0
+    error: str | None = None
+    widgets: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -144,11 +161,16 @@ class EditAutomateApp(ctk.CTk):
         self._studio_duration = 30.0
         self._studio_syncing = False
         self._studio_font_style = None
+        self._selected_account_id: str | None = None
+        self._selected_export_edit_id: str | None = None
+        self._upload_jobs: dict[str, QueuedUpload] = {}
+        self._upload_job_order: list[str] = []
 
         self._build_ui()
         self._refresh_songs_list()
         self._refresh_sources_list()
         self._refresh_edits_list()
+        self._refresh_accounts_list()
 
     # --- Shared UI helpers ---
 
@@ -312,11 +334,13 @@ class EditAutomateApp(ctk.CTk):
         self.tabs.add("Songs")
         self.tabs.add("Sources")
         self.tabs.add("Tweaker")
+        self.tabs.add("Accounts")
 
         self._build_create_tab()
         self._build_songs_tab()
         self._build_sources_tab()
         self._build_studio_tab()
+        self._build_accounts_tab()
         self._build_progress_footer()
         self.bind("<Command-Return>", lambda _e: self._try_generate_shortcut())
         self.bind("<Control-Return>", lambda _e: self._try_generate_shortcut())
@@ -402,16 +426,49 @@ class EditAutomateApp(ctk.CTk):
         opts.grid(row=6, column=0, columnspan=2, sticky="ew", padx=20, pady=(8, 12))
         self.per_frame_var = ctk.BooleanVar(value=False)
         self.beat_sync_var = ctk.BooleanVar(value=True)
+        self.preserve_dialog_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             opts, text="Beat-sync cuts to song BPM (recommended for promo edits)",
             variable=self.beat_sync_var, font=ctk.CTkFont(size=12), text_color=TEXT_MUTED,
             fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER, checkmark_color=BG,
+            command=self._on_beat_sync_toggle,
         ).pack(anchor="w", padx=14, pady=(12, 4))
+
+        beat_mode_row = ctk.CTkFrame(opts, fg_color="transparent")
+        beat_mode_row.pack(anchor="w", fill="x", padx=14, pady=(0, 4))
+        ctk.CTkLabel(
+            beat_mode_row,
+            text="Beat-sync style:",
+            font=ctk.CTkFont(size=12),
+            text_color=TEXT_MUTED,
+        ).pack(side="left", padx=(0, 8))
+        self.beat_sync_mode_var = ctk.StringVar(value="Standard")
+        self.beat_sync_mode_menu = ctk.CTkOptionMenu(
+            beat_mode_row,
+            variable=self.beat_sync_mode_var,
+            values=["Standard", "Beat drop (slow → fast)"],
+            width=200,
+            font=ctk.CTkFont(size=12),
+            fg_color=SURFACE_RAISED,
+            button_color=ACCENT,
+            button_hover_color=ACCENT_HOVER,
+            dropdown_fg_color=SURFACE,
+            dropdown_hover_color=SURFACE_RAISED,
+        )
+        self.beat_sync_mode_menu.pack(side="left")
+
+        ctk.CTkCheckBox(
+            opts, text="Preserve movie dialog / speech (remove background song only)",
+            variable=self.preserve_dialog_var, font=ctk.CTkFont(size=12), text_color=TEXT_MUTED,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER, checkmark_color=BG,
+        ).pack(anchor="w", padx=14, pady=(4, 4))
         ctk.CTkCheckBox(
             opts, text="Per-frame text detection (slower — moving captions only)",
             variable=self.per_frame_var, font=ctk.CTkFont(size=12), text_color=TEXT_MUTED,
             fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER, checkmark_color=BG,
         ).pack(anchor="w", padx=14, pady=(4, 12))
+
+        self._on_beat_sync_toggle()
 
         actions = ctk.CTkFrame(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1, border_color=BORDER)
         actions.grid(row=2, column=0, sticky="ew", pady=(4, 6))
@@ -843,6 +900,182 @@ class EditAutomateApp(ctk.CTk):
         self.edits_list = self._list_panel(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1)
         self.edits_list.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
         self.edits_list.grid_remove()
+
+    def _build_accounts_tab(self) -> None:
+        tab = self._scrollable_tab("Accounts")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=2)
+
+        hdr = ctk.CTkFrame(tab, fg_color="transparent")
+        hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 0))
+        ctk.CTkLabel(
+            hdr,
+            text="Log into TikTok accounts and publish finished edits from your library",
+            font=ctk.CTkFont(size=13),
+            text_color=TEXT_MUTED,
+        ).pack(side="left")
+        self._outline_btn(hdr, "Clear Finished", self._clear_finished_upload_jobs, width=100).pack(side="right")
+
+        left = ctk.CTkFrame(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1, border_color=BORDER)
+        left.grid(row=1, column=0, sticky="new", padx=(8, 4), pady=8)
+        left.grid_columnconfigure(0, weight=1)
+
+        left_hdr = ctk.CTkFrame(left, fg_color="transparent")
+        left_hdr.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        ctk.CTkLabel(
+            left_hdr, text="TikTok Accounts", font=ctk.CTkFont(size=14, weight="bold"), text_color=TEXT,
+        ).pack(side="left")
+        self._outline_btn(left_hdr, "+ Add Account", self._add_tiktok_account, width=110).pack(side="right")
+
+        self.accounts_list = self._list_panel(left, fg_color=SURFACE)
+        self.accounts_list.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+
+        account_actions = ctk.CTkFrame(left, fg_color="transparent")
+        account_actions.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+        self._outline_btn(account_actions, "Log In Again", self._relogin_tiktok_account, width=110).pack(
+            side="left", padx=(0, 8),
+        )
+        self._outline_btn(account_actions, "Remove", self._remove_tiktok_account, width=90).pack(side="left")
+
+        help_box = ctk.CTkFrame(left, fg_color=SURFACE, corner_radius=8, border_width=1, border_color=BORDER)
+        help_box.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
+        ctk.CTkLabel(
+            help_box,
+            text=(
+                "Add Account opens a browser window — sign in to TikTok and the app saves your session.\n"
+                "Sessions expire after a few weeks; use Log In Again to refresh.\n"
+                "You can also paste a sessionid cookie from DevTools → Application → Cookies."
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color=TEXT_DIM,
+            justify="left",
+            wraplength=320,
+        ).pack(anchor="w", padx=12, pady=10)
+
+        right = ctk.CTkFrame(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1, border_color=BORDER)
+        right.grid(row=1, column=1, sticky="new", padx=(4, 8), pady=8)
+        right.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            right, text="Export to TikTok", font=ctk.CTkFont(size=16, weight="bold"), text_color=TEXT,
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 4))
+
+        ctk.CTkLabel(
+            right,
+            text="Pick a finished edit from your library, choose an account, and post with caption + hashtags.",
+            font=ctk.CTkFont(size=12),
+            text_color=TEXT_DIM,
+            wraplength=480,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+
+        form = ctk.CTkFrame(right, fg_color="transparent")
+        form.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        form.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(form, text="Library edit", font=ctk.CTkFont(size=13), text_color=TEXT_MUTED).grid(
+            row=0, column=0, sticky="w", pady=6,
+        )
+        self.export_edit_pick = ctk.CTkComboBox(
+            form,
+            values=["(No edits yet)"],
+            height=38,
+            corner_radius=8,
+            border_color=BORDER,
+            fg_color=SURFACE,
+            button_color=BORDER,
+            dropdown_fg_color=SURFACE_RAISED,
+            command=self._on_export_edit_pick,
+        )
+        self.export_edit_pick.set("(No edits yet)")
+        self.export_edit_pick.grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=6)
+
+        ctk.CTkLabel(form, text="TikTok account", font=ctk.CTkFont(size=13), text_color=TEXT_MUTED).grid(
+            row=1, column=0, sticky="w", pady=6,
+        )
+        self.export_account_pick = ctk.CTkComboBox(
+            form,
+            values=["(Add an account first)"],
+            height=38,
+            corner_radius=8,
+            border_color=BORDER,
+            fg_color=SURFACE,
+            button_color=BORDER,
+            dropdown_fg_color=SURFACE_RAISED,
+            command=self._on_export_account_pick,
+        )
+        self.export_account_pick.set("(Add an account first)")
+        self.export_account_pick.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=6)
+
+        ctk.CTkLabel(form, text="Caption", font=ctk.CTkFont(size=13), text_color=TEXT_MUTED).grid(
+            row=2, column=0, sticky="nw", pady=(10, 6),
+        )
+        self.export_caption = ctk.CTkTextbox(
+            form,
+            height=90,
+            font=ctk.CTkFont(size=13),
+            fg_color=SURFACE,
+            text_color=TEXT,
+            corner_radius=8,
+            border_width=1,
+            border_color=BORDER,
+        )
+        self.export_caption.grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=(10, 6))
+
+        ctk.CTkLabel(form, text="Hashtags", font=ctk.CTkFont(size=13), text_color=TEXT_MUTED).grid(
+            row=3, column=0, sticky="w", pady=6,
+        )
+        self.export_hashtags = self._styled_entry(
+            form,
+            placeholder_text="#fyp #music #newmusic  or  fyp, music, viral",
+        )
+        self.export_hashtags.grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=6)
+
+        self.export_preview_label = ctk.CTkLabel(
+            form,
+            text="",
+            font=ctk.CTkFont(size=11),
+            text_color=TEXT_DIM,
+            anchor="w",
+            justify="left",
+            wraplength=420,
+        )
+        self.export_preview_label.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.export_caption.bind("<KeyRelease>", lambda _e: self._update_export_preview())
+        self.export_hashtags.bind("<KeyRelease>", lambda _e: self._update_export_preview())
+
+        self.export_video_preview = VideoPreview(right)
+        self.export_video_preview.grid(row=3, column=0, sticky="ew", padx=16, pady=(4, 8))
+
+        export_actions = ctk.CTkFrame(right, fg_color="transparent")
+        export_actions.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self._accent_btn(
+            export_actions, "▶  Export to TikTok", self._export_edit_to_tiktok, height=48,
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(side="left", fill="x", expand=True)
+        self._outline_btn(export_actions, "Reveal Video", self._reveal_export_edit, width=110).pack(
+            side="left", padx=(10, 0),
+        )
+
+        jobs_hdr = ctk.CTkFrame(right, fg_color="transparent")
+        jobs_hdr.grid(row=5, column=0, sticky="ew", padx=16, pady=(8, 4))
+        ctk.CTkLabel(
+            jobs_hdr, text="UPLOADS", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM,
+        ).pack(side="left")
+        self.upload_jobs_stats = ctk.CTkLabel(jobs_hdr, text="", font=ctk.CTkFont(size=11), text_color=TEXT_DIM)
+        self.upload_jobs_stats.pack(side="right")
+
+        self.upload_jobs_frame = self._list_panel(
+            right, fg_color=SURFACE, corner_radius=10, border_width=1, border_color=BORDER,
+        )
+        self.upload_jobs_frame.grid(row=6, column=0, sticky="ew", padx=16, pady=(4, 16))
+        self._upload_jobs_empty_label = ctk.CTkLabel(
+            self.upload_jobs_frame,
+            text=f"Upload jobs appear here — {FOXTIDE_EASTER_EGG}",
+            text_color=TEXT_DIM,
+            font=ctk.CTkFont(size=11),
+        )
+        self._upload_jobs_empty_label.pack(pady=12, padx=12)
 
     def _build_progress_footer(self) -> None:
         footer = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=14, border_width=1, border_color=BORDER)
@@ -1517,6 +1750,403 @@ class EditAutomateApp(ctk.CTk):
         self.tabs.set("Create")
         self._log(f"Using source '{src.title}' — will skip download & inpainting")
 
+    # --- Accounts tab ---
+
+    def _refresh_accounts_list(self) -> None:
+        for w in self.accounts_list.winfo_children():
+            w.destroy()
+
+        accounts = self._library.list_accounts()
+        if not accounts:
+            ctk.CTkLabel(
+                self.accounts_list,
+                text=f"No accounts yet — click Add Account to log in ({FOXTIDE_EASTER_EGG})",
+                text_color=TEXT_DIM,
+                font=ctk.CTkFont(size=11),
+            ).pack(pady=20, padx=12)
+        else:
+            for account in accounts:
+                handle = f"@{account.username}" if account.username else "No handle"
+                session_hint = f"…{account.session_id[-4:]}" if len(account.session_id) >= 4 else "saved"
+                btn = ctk.CTkButton(
+                    self.accounts_list,
+                    text=f"{account.label}\n{handle} · session {session_hint}",
+                    anchor="w",
+                    height=52,
+                    fg_color=ACCENT_DIM if account.id == self._selected_account_id else SURFACE_RAISED,
+                    hover_color=BORDER,
+                    text_color=TEXT,
+                    font=ctk.CTkFont(size=12),
+                    command=lambda a=account: self._select_account(a),
+                )
+                btn.pack(fill="x", pady=4)
+
+        account_options = [a.display_name() for a in accounts] or ["(Add an account first)"]
+        self.export_account_pick.configure(values=account_options)
+        if not accounts:
+            self._selected_account_id = None
+            self.export_account_pick.set("(Add an account first)")
+        elif self._selected_account_id:
+            selected = self._library.get_account(self._selected_account_id)
+            if selected:
+                self.export_account_pick.set(selected.display_name())
+            else:
+                self._selected_account_id = accounts[0].id
+                self.export_account_pick.set(accounts[0].display_name())
+        else:
+            self._selected_account_id = accounts[0].id
+            self.export_account_pick.set(accounts[0].display_name())
+
+        self._refresh_export_edits_list()
+
+    def _select_account(self, account: TikTokAccount) -> None:
+        self._selected_account_id = account.id
+        self.export_account_pick.set(account.display_name())
+        self._refresh_accounts_list()
+
+    def _on_export_account_pick(self, choice: str) -> None:
+        if choice.startswith("("):
+            self._selected_account_id = None
+            return
+        for account in self._library.list_accounts():
+            if account.display_name() == choice or account.id[:6] in choice:
+                self._selected_account_id = account.id
+                break
+
+    def _refresh_export_edits_list(self) -> None:
+        edits = self._library.list_edits()
+        options = [f"{e.title} ({e.id[:6]})" for e in edits] or ["(No edits yet)"]
+        self.export_edit_pick.configure(values=options)
+        if not edits:
+            self._selected_export_edit_id = None
+            self.export_edit_pick.set("(No edits yet)")
+            self.export_video_preview.unload()
+            self.export_preview_label.configure(text="")
+            return
+        if self._selected_export_edit_id:
+            for edit in edits:
+                if edit.id == self._selected_export_edit_id:
+                    self.export_edit_pick.set(f"{edit.title} ({edit.id[:6]})")
+                    self._select_export_edit(edit)
+                    return
+        self.export_edit_pick.set(options[0])
+        self._select_export_edit(edits[0])
+
+    def _on_export_edit_pick(self, choice: str) -> None:
+        if choice.startswith("("):
+            return
+        for edit in self._library.list_edits():
+            if edit.id[:6] in choice:
+                self._select_export_edit(edit)
+                break
+
+    def _select_export_edit(self, edit: object) -> None:
+        from app.storage import EditRecord
+
+        assert isinstance(edit, EditRecord)
+        self._selected_export_edit_id = edit.id
+        video_path = Path(edit.with_audio_path)
+        if video_path.exists():
+            self.export_video_preview.load(video_path)
+        else:
+            self.export_video_preview.unload()
+        if not self.export_caption.get("1.0", "end").strip():
+            self.export_caption.delete("1.0", "end")
+            self.export_caption.insert("1.0", edit.title)
+        self._update_export_preview()
+
+    def _update_export_preview(self) -> None:
+        caption = self.export_caption.get("1.0", "end").strip()
+        hashtags = self.export_hashtags.get().strip()
+        preview = build_post_description(caption, hashtags)
+        if preview:
+            shown = preview if len(preview) <= 160 else preview[:157] + "…"
+            self.export_preview_label.configure(text=f"Post preview: {shown}")
+        else:
+            self.export_preview_label.configure(text="")
+
+    def _reveal_export_edit(self) -> None:
+        if not self._selected_export_edit_id:
+            messagebox.showinfo("No edit", "Select a library edit first.")
+            return
+        edit = self._library.get_edit(self._selected_export_edit_id)
+        if not edit:
+            return
+        path = Path(edit.with_audio_path)
+        if path.exists():
+            self._reveal_path(path)
+        else:
+            messagebox.showerror("Missing file", f"Video not found:\n{path}")
+
+    def _add_tiktok_account(self) -> None:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Add TikTok Account")
+        dialog.geometry("440x360")
+        dialog.configure(fg_color=SURFACE)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        frame = ctk.CTkFrame(dialog, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1, border_color=BORDER)
+        frame.pack(fill="both", expand=True, padx=16, pady=16)
+        frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            frame, text="Add TikTok Account", font=ctk.CTkFont(size=16, weight="bold"), text_color=TEXT,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(16, 12))
+
+        ctk.CTkLabel(frame, text="Display name", font=ctk.CTkFont(size=13), text_color=TEXT_MUTED).grid(
+            row=1, column=0, sticky="w", padx=16, pady=6,
+        )
+        label_entry = self._styled_entry(frame, placeholder_text="Promo account")
+        label_entry.grid(row=1, column=1, sticky="ew", padx=(0, 16), pady=6)
+
+        ctk.CTkLabel(frame, text="@username", font=ctk.CTkFont(size=13), text_color=TEXT_MUTED).grid(
+            row=2, column=0, sticky="w", padx=16, pady=6,
+        )
+        username_entry = self._styled_entry(frame, placeholder_text="optional")
+        username_entry.grid(row=2, column=1, sticky="ew", padx=(0, 16), pady=6)
+
+        ctk.CTkLabel(frame, text="Session ID", font=ctk.CTkFont(size=13), text_color=TEXT_MUTED).grid(
+            row=3, column=0, sticky="nw", padx=16, pady=(10, 6),
+        )
+        session_entry = self._styled_entry(frame, placeholder_text="Paste sessionid cookie (optional if using browser login)")
+        session_entry.grid(row=3, column=1, sticky="ew", padx=(0, 16), pady=(10, 6))
+
+        status_lbl = ctk.CTkLabel(frame, text="", font=ctk.CTkFont(size=11), text_color=TEXT_DIM, wraplength=360)
+        status_lbl.grid(row=4, column=0, columnspan=2, sticky="w", padx=16, pady=(4, 8))
+
+        btn_row = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_row.grid(row=5, column=0, columnspan=2, sticky="ew", padx=16, pady=(8, 16))
+
+        def close_dialog() -> None:
+            dialog.grab_release()
+            dialog.destroy()
+
+        def save_account(session_id: str) -> None:
+            label = label_entry.get().strip()
+            username = username_entry.get().strip()
+            if not session_id.strip():
+                messagebox.showerror("Missing session", "Log in with the browser or paste a sessionid cookie.", parent=dialog)
+                return
+            record = self._library.add_account(label or username or "TikTok account", session_id, username)
+            self._selected_account_id = record.id
+            self._refresh_accounts_list()
+            self._log(f"Added TikTok account: {record.display_name()}")
+            close_dialog()
+
+        def browser_login() -> None:
+            status_lbl.configure(text="Opening browser — sign in to TikTok…")
+            dialog.update_idletasks()
+
+            def worker() -> None:
+                try:
+                    session_id = capture_session_via_browser()
+                    self.after(0, lambda sid=session_id: (status_lbl.configure(text="Logged in — saving account…"), save_account(sid)))
+                except Exception as exc:
+                    err = format_user_error(exc)
+                    self.after(0, lambda msg=err: (status_lbl.configure(text=""), messagebox.showerror("Login failed", msg, parent=dialog)))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        self._accent_btn(btn_row, "Log In with Browser", browser_login, height=40).pack(side="left", padx=(0, 8))
+        self._outline_btn(btn_row, "Save with Session ID", lambda: save_account(session_entry.get()), width=150).pack(side="left")
+        self._outline_btn(btn_row, "Cancel", close_dialog, width=80).pack(side="right")
+
+    def _relogin_tiktok_account(self) -> None:
+        if not self._selected_account_id:
+            messagebox.showinfo("No account", "Select an account to refresh its login.")
+            return
+        account = self._library.get_account(self._selected_account_id)
+        if not account:
+            return
+        self._run_bg(f"Logging in {account.label}…", lambda: self._do_relogin(account))
+
+    def _do_relogin(self, account: TikTokAccount) -> None:
+        session_id = capture_session_via_browser()
+        account.session_id = session_id
+        self._library.update_account(account)
+        self.after(0, lambda: (self._refresh_accounts_list(), self._log(f"Refreshed login for {account.display_name()}")))
+
+    def _remove_tiktok_account(self) -> None:
+        if not self._selected_account_id:
+            messagebox.showinfo("No account", "Select an account to remove.")
+            return
+        account = self._library.get_account(self._selected_account_id)
+        if not account:
+            return
+        if not messagebox.askyesno("Remove account", f"Remove {account.display_name()} from this app?"):
+            return
+        self._library.delete_account(account.id)
+        self._selected_account_id = None
+        self._refresh_accounts_list()
+        self._log(f"Removed account: {account.display_name()}")
+
+    def _export_edit_to_tiktok(self) -> None:
+        if not self._selected_export_edit_id:
+            messagebox.showerror("No edit", "Create an edit first, then pick it from the library.")
+            return
+        if not self._selected_account_id:
+            messagebox.showerror("No account", "Add and select a TikTok account first.")
+            return
+        edit = self._library.get_edit(self._selected_export_edit_id)
+        account = self._library.get_account(self._selected_account_id)
+        if not edit or not account:
+            messagebox.showerror("Missing data", "Could not find the selected edit or account.")
+            return
+        video_path = Path(edit.with_audio_path)
+        if not video_path.exists():
+            messagebox.showerror("Missing video", f"Edit file not found:\n{video_path}")
+            return
+
+        caption = self.export_caption.get("1.0", "end").strip()
+        hashtags = self.export_hashtags.get().strip()
+        if not caption and not hashtags:
+            if not messagebox.askyesno("Empty caption", "Post without a caption or hashtags?"):
+                return
+
+        job_id = uuid.uuid4().hex[:12]
+        job = QueuedUpload(
+            id=job_id,
+            edit_id=edit.id,
+            account_id=account.id,
+            edit_title=edit.title,
+            account_label=account.display_name(),
+        )
+        self._upload_jobs[job_id] = job
+        self._upload_job_order.append(job_id)
+        self._render_upload_job_row(job)
+        self._update_upload_jobs_stats()
+        self._set_status_dot(ACCENT)
+        self._log(f"TikTok export started: {edit.title} → {account.display_name()}")
+        threading.Thread(
+            target=self._run_upload_job,
+            args=(job_id, video_path, account.session_id, caption, hashtags),
+            daemon=True,
+        ).start()
+
+    def _update_upload_jobs_stats(self) -> None:
+        running = sum(1 for j in self._upload_jobs.values() if j.status == "running")
+        done = sum(1 for j in self._upload_jobs.values() if j.status == "done")
+        failed = sum(1 for j in self._upload_jobs.values() if j.status == "error")
+        parts: list[str] = []
+        if running:
+            parts.append(f"{running} running")
+        if done:
+            parts.append(f"{done} done")
+        if failed:
+            parts.append(f"{failed} failed")
+        self.upload_jobs_stats.configure(text=" · ".join(parts) if parts else "")
+
+    def _render_upload_job_row(self, job: QueuedUpload) -> None:
+        if self._upload_jobs_empty_label.winfo_exists():
+            self._upload_jobs_empty_label.pack_forget()
+
+        row = ctk.CTkFrame(self.upload_jobs_frame, fg_color=SURFACE_RAISED, corner_radius=8, border_width=1, border_color=BORDER)
+        row.pack(fill="x", pady=3, padx=4)
+        row.grid_columnconfigure(1, weight=1)
+
+        status_colors = {"running": ACCENT, "done": SUCCESS, "error": WARNING}
+        dot = ctk.CTkLabel(row, text="●", font=ctk.CTkFont(size=10), text_color=status_colors.get(job.status, TEXT_DIM), width=16)
+        dot.grid(row=0, column=0, rowspan=2, padx=(10, 6), pady=6, sticky="w")
+        title_lbl = ctk.CTkLabel(
+            row, text=f"{job.edit_title} → {job.account_label}", font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=TEXT, anchor="w",
+        )
+        title_lbl.grid(row=0, column=1, sticky="ew", pady=(6, 0))
+        step_lbl = ctk.CTkLabel(row, text=job.error or job.step, font=ctk.CTkFont(size=11), text_color=TEXT_DIM, anchor="w")
+        step_lbl.grid(row=1, column=1, sticky="ew", pady=(0, 6))
+        pct_lbl = ctk.CTkLabel(row, text="0%", font=ctk.CTkFont(size=11), text_color=TEXT_DIM, width=36)
+        pct_lbl.grid(row=0, column=2, rowspan=2, padx=(4, 10), pady=6)
+        bar = ctk.CTkProgressBar(row, height=4, width=80, progress_color=ACCENT, fg_color=SURFACE)
+        bar.set(job.fraction)
+        bar.grid(row=0, column=3, rowspan=2, padx=(0, 10), pady=6)
+
+        job.widgets = {"row": row, "dot": dot, "title": title_lbl, "step": step_lbl, "pct": pct_lbl, "bar": bar}
+
+    def _update_upload_job_ui(self, job_id: str) -> None:
+        job = self._upload_jobs.get(job_id)
+        if not job or not job.widgets:
+            return
+        status_colors = {"running": ACCENT, "done": SUCCESS, "error": WARNING}
+        job.widgets["dot"].configure(text_color=status_colors.get(job.status, TEXT_DIM))
+        job.widgets["step"].configure(text=job.error or job.step)
+        job.widgets["pct"].configure(text=f"{int(job.fraction * 100)}%")
+        job.widgets["bar"].set(job.fraction)
+        self._update_upload_jobs_stats()
+
+    def _upload_job_progress(self, job_id: str, message: str, fraction: float) -> None:
+        def update() -> None:
+            job = self._upload_jobs.get(job_id)
+            if not job:
+                return
+            job.step = message
+            job.fraction = max(0.0, min(1.0, fraction))
+            job.status = "running"
+            self._update_upload_job_ui(job_id)
+            if self._has_active_work():
+                self._set_status_dot(ACCENT)
+            self._log(f"[upload {job_id[:6]}] {message}")
+        self.after(0, update)
+
+    def _run_upload_job(
+        self,
+        job_id: str,
+        video_path: Path,
+        session_id: str,
+        caption: str,
+        hashtags: str,
+    ) -> None:
+        try:
+            upload_video(
+                video_path,
+                session_id,
+                caption,
+                hashtags,
+                progress=lambda m, f, jid=job_id: self._upload_job_progress(jid, m, f),
+            )
+            self.after(0, lambda jid=job_id: self._upload_job_done(jid))
+        except Exception as exc:
+            self.after(0, lambda e=exc, jid=job_id: self._upload_job_error(jid, e))
+
+    def _upload_job_done(self, job_id: str) -> None:
+        job = self._upload_jobs[job_id]
+        job.status = "done"
+        job.step = "Posted to TikTok"
+        job.fraction = 1.0
+        self._update_upload_job_ui(job_id)
+        account = self._library.get_account(job.account_id)
+        if account:
+            account.last_export_at = datetime.now(timezone.utc).isoformat()
+            self._library.update_account(account)
+        self._log(f"TikTok export done: {job.edit_title} → {job.account_label}")
+        if not self._has_active_work():
+            self._set_status_dot(SUCCESS)
+            self.status_label.configure(text="Ready")
+        messagebox.showinfo("Posted", f"{job.edit_title} was uploaded to {job.account_label}.")
+
+    def _upload_job_error(self, job_id: str, exc: Exception) -> None:
+        job = self._upload_jobs[job_id]
+        job.status = "error"
+        job.error = format_user_error(exc)
+        job.step = "Failed"
+        self._update_upload_job_ui(job_id)
+        self._log(f"ERROR [upload {job_id[:6]}]: {job.error}")
+        if not self._has_active_work():
+            self._set_status_dot(WARNING)
+            self.status_label.configure(text="Ready")
+        messagebox.showerror("Upload failed", f"{job.edit_title}\n\n{job.error}")
+
+    def _clear_finished_upload_jobs(self) -> None:
+        to_remove = [jid for jid in self._upload_job_order if self._upload_jobs[jid].status in ("done", "error")]
+        for jid in to_remove:
+            job = self._upload_jobs.pop(jid)
+            self._upload_job_order.remove(jid)
+            if job.widgets.get("row"):
+                job.widgets["row"].destroy()
+        if not self._upload_job_order and self._upload_jobs_empty_label.winfo_exists():
+            self._upload_jobs_empty_label.pack(pady=12, padx=12)
+        self._update_upload_jobs_stats()
+
     # --- Tweaker tab ---
 
     def _tweak_color_rgb(self) -> tuple[int, int, int] | None:
@@ -1554,6 +2184,8 @@ class EditAutomateApp(ctk.CTk):
         edits = self._library.list_edits()
         options = [f"{e.title} ({e.id[:6]})" for e in edits] or ["(No edits yet)"]
         self.studio_edit_pick.configure(values=options)
+        if hasattr(self, "export_edit_pick"):
+            self._refresh_export_edits_list()
         if not edits:
             self.studio_edit_pick.set("(No edits yet)")
             return
@@ -1832,6 +2464,17 @@ class EditAutomateApp(ctk.CTk):
         self.tabs.set("Songs")
         self._select_song(songs[0])
 
+    def _on_beat_sync_toggle(self) -> None:
+        enabled = self.beat_sync_var.get()
+        state = "normal" if enabled else "disabled"
+        self.beat_sync_mode_menu.configure(state=state)
+
+    def _beat_sync_mode_from_ui(self) -> str:
+        label = self.beat_sync_mode_var.get()
+        if "Beat drop" in label:
+            return "beat_drop"
+        return "standard"
+
     def _browse_audio(self) -> None:
         path = filedialog.askopenfilename(
             title="Choose replacement song",
@@ -1900,6 +2543,8 @@ class EditAutomateApp(ctk.CTk):
             snippet_end=snippet_end,
             lyrics_override=lyrics_override,
             beat_sync=self.beat_sync_var.get(),
+            beat_sync_mode=self._beat_sync_mode_from_ui() if self.beat_sync_var.get() else "standard",
+            preserve_dialog=self.preserve_dialog_var.get(),
             library=self._library,
             song_id=song_id,
             source_id=self._selected_source_id,

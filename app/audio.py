@@ -1,4 +1,4 @@
-"""Audio replacement and lyrics transcription."""
+"""Audio replacement, lyrics transcription, and dialog preservation."""
 
 from __future__ import annotations
 
@@ -7,7 +7,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.utils import ProgressCallback, default_progress, get_video_info, get_whisper_device, run_ffmpeg
+import numpy as np
+
+from app.utils import ProgressCallback, default_progress, get_video_info, get_whisper_device, probe_video, run_ffmpeg
 
 _WHISPER_MODEL = None
 _WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "small")
@@ -24,6 +26,350 @@ class LyricLine:
     text: str
     start: float
     end: float
+
+
+@dataclass
+class SpeechRegion:
+    start: float
+    end: float
+    text: str = ""
+    is_likely_dialog: bool = True
+
+
+def _merge_nearby_regions(
+    regions: list[SpeechRegion],
+    *,
+    gap_sec: float = 0.35,
+) -> list[SpeechRegion]:
+    if not regions:
+        return []
+    ordered = sorted(regions, key=lambda r: r.start)
+    merged: list[SpeechRegion] = [
+        SpeechRegion(
+            start=ordered[0].start,
+            end=ordered[0].end,
+            text=ordered[0].text,
+            is_likely_dialog=ordered[0].is_likely_dialog,
+        )
+    ]
+    for region in ordered[1:]:
+        prev = merged[-1]
+        if region.start - prev.end <= gap_sec:
+            prev.end = max(prev.end, region.end)
+            if region.text:
+                prev.text = f"{prev.text} {region.text}".strip()
+            prev.is_likely_dialog = prev.is_likely_dialog or region.is_likely_dialog
+        else:
+            merged.append(region)
+    return merged
+
+
+def _looks_like_sung_lyrics(text: str) -> bool:
+    """Heuristic: repeated short phrases suggest sung lyrics rather than dialog."""
+    words = re.findall(r"[a-z']+", text.lower())
+    if len(words) < 4:
+        return False
+    return len(set(words)) / len(words) < 0.55
+
+
+def detect_speech_regions(
+    audio_path: Path,
+    progress: ProgressCallback = default_progress,
+    *,
+    replacement_lyrics: list[LyricLine] | None = None,
+) -> list[SpeechRegion]:
+    """
+    Detect speech/dialog in mixed audio (e.g. movie clip + background song).
+    Filters segments that overlap replacement-song lyrics when provided.
+    """
+    progress("Scanning original audio for dialog/speech…", 0.14)
+    model = _get_whisper(progress)
+    result = model.transcribe(
+        str(audio_path),
+        word_timestamps=True,
+        language="en",
+        task="transcribe",
+        condition_on_previous_text=False,
+        no_speech_threshold=0.55,
+        logprob_threshold=-1.0,
+    )
+
+    lyric_windows: list[tuple[float, float]] = []
+    if replacement_lyrics:
+        lyric_windows = [(line.start, line.end) for line in replacement_lyrics]
+
+    def overlaps_lyrics(start: float, end: float) -> bool:
+        for ls, le in lyric_windows:
+            if end > ls + 0.05 and start < le - 0.05:
+                return True
+        return False
+
+    regions: list[SpeechRegion] = []
+    for segment in result.get("segments", []):
+        if segment.get("no_speech_prob", 1.0) > 0.62:
+            continue
+        if segment.get("avg_logprob", 0.0) < -1.05:
+            continue
+        text = (segment.get("text") or "").strip()
+        if not text or _HALLUCINATION_RE.search(text):
+            continue
+        start = float(segment["start"])
+        end = float(segment["end"])
+        if end - start < 0.12:
+            continue
+        sung = _looks_like_sung_lyrics(text)
+        likely_dialog = not sung and not overlaps_lyrics(start, end)
+        if likely_dialog or (not sung and segment.get("no_speech_prob", 1.0) < 0.35):
+            regions.append(
+                SpeechRegion(start=start, end=end, text=text, is_likely_dialog=likely_dialog)
+            )
+
+    merged = _merge_nearby_regions(regions)
+    dialog_count = sum(1 for r in merged if r.is_likely_dialog)
+    progress(
+        f"Found {len(merged)} speech region(s) ({dialog_count} likely dialog)",
+        0.16,
+    )
+    return merged
+
+
+def has_extraneous_speech(
+    audio_path: Path,
+    progress: ProgressCallback = default_progress,
+) -> bool:
+    """Quick check whether the source clip contains non-music speech."""
+    regions = detect_speech_regions(audio_path, progress)
+    return any(r.is_likely_dialog for r in regions)
+
+
+def _load_mono_audio(path: Path, sr: int = 44100) -> tuple[np.ndarray, int]:
+    import librosa
+
+    y, loaded_sr = librosa.load(str(path), sr=sr, mono=True)
+    return y, loaded_sr
+
+
+def _write_wav(path: Path, y: np.ndarray, sr: int) -> None:
+    import soundfile as sf
+
+    peak = float(np.max(np.abs(y))) if y.size else 0.0
+    if peak > 1.0:
+        y = y / peak
+    sf.write(str(path), y, sr)
+
+
+def isolate_dialog_from_mixed(
+    original_audio_path: Path,
+    speech_regions: list[SpeechRegion],
+    output_path: Path,
+    progress: ProgressCallback = default_progress,
+    *,
+    padding_sec: float = 0.18,
+) -> Path:
+    """
+    Attenuate background music in speech regions while keeping dialog.
+    Uses HPSS harmonic/percussive split and speech-band emphasis.
+    """
+    import librosa
+
+    progress("Isolating dialog from background music…", 0.17)
+    y, sr = _load_mono_audio(original_audio_path)
+    if y.size == 0:
+        raise RuntimeError("Original audio is empty")
+
+    dialog = np.zeros_like(y)
+    pad_samples = int(padding_sec * sr)
+
+    for region in speech_regions:
+        if not region.is_likely_dialog:
+            continue
+        s = max(0, int(region.start * sr) - pad_samples)
+        e = min(len(y), int(region.end * sr) + pad_samples)
+        if e - s < sr // 20:
+            continue
+        seg = y[s:e]
+        harmonic, percussive = librosa.effects.hpss(seg, margin=2.5)
+        speech_est = percussive * 0.72 + seg * 0.38 - harmonic * 0.35
+        speech_est = librosa.effects.preemphasis(speech_est, coef=0.92)
+        dialog[s:e] += speech_est
+
+    if not np.any(np.abs(dialog) > 1e-6):
+        progress("No dialog isolated — using speech-only gate", 0.175)
+        for region in speech_regions:
+            if not region.is_likely_dialog:
+                continue
+            s = max(0, int(region.start * sr) - pad_samples)
+            e = min(len(y), int(region.end * sr) + pad_samples)
+            dialog[s:e] = y[s:e]
+
+    wav_tmp = output_path.with_suffix(".wav")
+    _write_wav(wav_tmp, dialog, sr)
+    run_ffmpeg(["-i", str(wav_tmp), "-c:a", "libmp3lame", "-q:a", "2", str(output_path)])
+    wav_tmp.unlink(missing_ok=True)
+    progress("Dialog track extracted", 0.18)
+    return output_path
+
+
+def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
+    t = np.clip((x - edge0) / max(edge1 - edge0, 1e-9), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def build_mixed_audio_track(
+    new_song_path: Path,
+    dialog_path: Path | None,
+    speech_regions: list[SpeechRegion],
+    duration: float,
+    output_path: Path,
+    progress: ProgressCallback = default_progress,
+    *,
+    snippet_start: float = 0.0,
+    snippet_end: float | None = None,
+    song_duck_db: float = -14.0,
+    dialog_gain: float = 1.15,
+) -> Path:
+    """Mix replacement song with preserved dialog; duck song during speech."""
+    progress("Mixing new song with preserved dialog…", 0.765)
+    song, sr = _load_mono_audio(new_song_path)
+
+    if snippet_start > 0 or snippet_end is not None:
+        s0 = int(snippet_start * sr)
+        s1 = int((snippet_end if snippet_end is not None else len(song) / sr) * sr)
+        song = song[s0:s1]
+
+    target_samples = max(1, int(duration * sr))
+    if len(song) < target_samples:
+        reps = int(np.ceil(target_samples / max(len(song), 1)))
+        song = np.tile(song, reps)[:target_samples]
+    else:
+        song = song[:target_samples]
+
+    mix = song.copy()
+    duck_linear = 10 ** (song_duck_db / 20.0)
+
+    if dialog_path and dialog_path.is_file():
+        dialog, _ = _load_mono_audio(dialog_path, sr=sr)
+        if len(dialog) < target_samples:
+            dialog = np.pad(dialog, (0, target_samples - len(dialog)))
+        else:
+            dialog = dialog[:target_samples]
+
+        envelope = np.zeros(target_samples, dtype=float)
+        fade = int(0.12 * sr)
+        for region in speech_regions:
+            if not region.is_likely_dialog:
+                continue
+            s = max(0, int(region.start * sr))
+            e = min(target_samples, int(region.end * sr))
+            if e <= s:
+                continue
+            envelope[s:e] = 1.0
+            if fade > 0:
+                ramp = _smoothstep(0, fade, np.arange(min(fade, e - s), dtype=float))
+                envelope[s : s + len(ramp)] = np.maximum(envelope[s : s + len(ramp)], ramp)
+                tail = _smoothstep(0, fade, np.arange(min(fade, e - s), dtype=float)[::-1])
+                envelope[e - len(tail) : e] = np.maximum(envelope[e - len(tail) : e], tail)
+
+        mix = mix * (1.0 - envelope * (1.0 - duck_linear)) + dialog * envelope * dialog_gain
+
+    peak = float(np.max(np.abs(mix))) if mix.size else 0.0
+    if peak > 0.98:
+        mix = mix * (0.98 / peak)
+
+    wav_path = output_path.with_suffix(".wav")
+    _write_wav(wav_path, mix, sr)
+    run_ffmpeg(["-i", str(wav_path), "-c:a", "aac", "-b:a", "320k", str(output_path)])
+    wav_path.unlink(missing_ok=True)
+    progress("Mixed audio track ready", 0.77)
+    return output_path
+
+
+def render_dialog_on_output_timeline(
+    isolated_dialog_path: Path,
+    original_regions: list[SpeechRegion],
+    output_regions: list[SpeechRegion],
+    output_duration: float,
+    output_path: Path,
+    progress: ProgressCallback = default_progress,
+) -> Path:
+    """Place isolated dialog samples on the beat-synced output timeline."""
+    progress("Aligning dialog to beat-synced timeline…", 0.179)
+    dialog, sr = _load_mono_audio(isolated_dialog_path)
+    target_samples = max(1, int(output_duration * sr))
+    out = np.zeros(target_samples, dtype=float)
+
+    orig_dialog = [r for r in original_regions if r.is_likely_dialog]
+    out_dialog = [r for r in output_regions if r.is_likely_dialog]
+    pair_count = min(len(orig_dialog), len(out_dialog))
+    for idx in range(pair_count):
+        orig = orig_dialog[idx]
+        mapped = out_dialog[idx]
+        src_start = max(0, int(orig.start * sr))
+        src_end = min(len(dialog), int(orig.end * sr))
+        if src_end - src_start < sr // 30:
+            continue
+        chunk = dialog[src_start:src_end]
+        dst_start = max(0, int(mapped.start * sr))
+        dst_end = min(target_samples, int(mapped.end * sr))
+        dst_len = dst_end - dst_start
+        if dst_len <= 0:
+            continue
+        if len(chunk) != dst_len:
+            chunk = np.interp(
+                np.linspace(0, len(chunk) - 1, dst_len),
+                np.arange(len(chunk)),
+                chunk,
+            )
+        out[dst_start:dst_end] += chunk
+
+    wav_tmp = output_path.with_suffix(".wav")
+    _write_wav(wav_tmp, out, sr)
+    run_ffmpeg(["-i", str(wav_tmp), "-c:a", "libmp3lame", "-q:a", "2", str(output_path)])
+    wav_tmp.unlink(missing_ok=True)
+    return output_path
+
+
+def replace_audio_with_dialog(
+    video_path: Path,
+    mixed_audio_path: Path,
+    output_path: Path,
+    progress: ProgressCallback = default_progress,
+) -> Path:
+    """Mux a pre-mixed audio track onto video."""
+    progress("Applying mixed audio (song + dialog)…", 0.775)
+    _, _, _, video_duration = get_video_info(video_path)
+    audio_duration = _audio_duration(mixed_audio_path)
+    duration = min(video_duration, audio_duration) if audio_duration > 0 else video_duration
+
+    run_ffmpeg(
+        [
+            "-i",
+            str(video_path),
+            "-i",
+            str(mixed_audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "320k",
+            "-shortest",
+            "-t",
+            str(duration),
+            str(output_path),
+        ]
+    )
+    progress("Audio replaced (dialog preserved)", 0.78)
+    return output_path
+
+
+def video_has_audio(path: Path) -> bool:
+    data = probe_video(path)
+    return any(s.get("codec_type") == "audio" for s in data.get("streams", []))
 
 
 def _get_whisper(progress: ProgressCallback | None = None):
