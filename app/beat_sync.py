@@ -38,6 +38,16 @@ def _audio_duration(path: Path) -> float:
     return float(data["format"].get("duration", 0))
 
 
+def _numpy_scalar(value: object, default: float = 0.0) -> float:
+    """Coerce librosa/numpy return values to a plain Python float."""
+    if value is None:
+        return default
+    arr = np.asarray(value)
+    if arr.size == 0:
+        return default
+    return float(arr.reshape(-1)[0])
+
+
 def analyze_audio_beats(
     audio_path: Path,
     progress: ProgressCallback = default_progress,
@@ -56,17 +66,18 @@ def analyze_audio_beats(
 
     progress("Analyzing song BPM and beat grid…", 0.72)
     y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
-    duration = float(librosa.get_duration(y=y, sr=sr))
+    duration = _numpy_scalar(librosa.get_duration(y=y, sr=sr))
 
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, units="frames")
     beat_times = librosa.frames_to_time(beat_frames, sr=sr).tolist()
 
+    tempo_bpm = _numpy_scalar(tempo)
     if not beat_times:
-        bpm = float(tempo) if tempo else 120.0
+        bpm = tempo_bpm or 120.0
         interval = 60.0 / max(bpm, 1.0)
         beat_times = [i * interval for i in range(int(duration / interval) + 1)]
 
-    bpm = float(tempo) if tempo else (60.0 * len(beat_times) / max(duration, 0.1))
+    bpm = tempo_bpm or (60.0 * len(beat_times) / max(duration, 0.1))
 
     # Ensure beat grid covers full duration
     if beat_times[-1] < duration - 0.05:
