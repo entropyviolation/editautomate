@@ -21,6 +21,7 @@ brew install ffmpeg   # macOS
 ```bash
 cd editautomate
 pip install -r requirements.txt
+python scripts/download_models.py   # pre-download Whisper, EasyOCR, LaMa (~1–2 GB)
 ```
 
 If TikTok downloads fail, update yt-dlp:
@@ -29,7 +30,7 @@ If TikTok downloads fail, update yt-dlp:
 pip install -U yt-dlp
 ```
 
-First run downloads EasyOCR, Whisper, and LaMa model weights (~1–2 GB total).
+First run normally downloads model weights automatically; `download_models.py` is recommended on a fresh machine so SSL/certificate issues surface in the terminal instead of the GUI.
 
 ## Run
 
@@ -96,6 +97,7 @@ TikTok URL → download (best quality)
 | Issue | Fix |
 |-------|-----|
 | `ffmpeg not found` | Install ffmpeg and restart terminal |
+| SSL / certificate error on song upload | Fresh Python installs often lack HTTPS certs. Run `pip install -U certifi` then `python scripts/download_models.py`. On macOS with python.org Python: `open /Applications/Python*/Install\ Certificates.command` |
 | Slow inpainting | Ensure PyTorch is installed; Apple Silicon and NVIDIA GPUs are used automatically. Shorter clips still process faster. |
 | Wrong font | Install Arial Black / Impact; app tries common TikTok fonts |
 | Download fails | Check URL is public; update yt-dlp: `pip install -U yt-dlp` |

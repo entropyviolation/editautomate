@@ -29,7 +29,7 @@ from app.caption_timeline import CaptionTimeline
 from app.studio_preview import StudioPreview
 from app.video_preview import VideoPreview
 from app.fonts import TIKTOK_FONT_CANDIDATES
-from app.utils import ensure_dir, get_video_info, work_dir
+from app.utils import ensure_dir, format_user_error, get_video_info, work_dir
 from app.waveform import WaveformSelector
 
 
@@ -1908,13 +1908,13 @@ class EditAutomateApp(ctk.CTk):
     def _job_error(self, job_id: str, exc: Exception) -> None:
         job = self._jobs[job_id]
         job.status = "error"
-        job.error = str(exc)
+        job.error = format_user_error(exc)
         job.step = "Failed"
         self._update_job_ui(job_id)
         self._set_status_dot(WARNING)
         self.status_label.configure(text=f"Error: {job.title}")
-        self._log(f"ERROR [{job.title}]: {exc}")
-        messagebox.showerror("Processing failed", f"{job.title}\n\n{exc}")
+        self._log(f"ERROR [{job.title}]: {job.error}")
+        messagebox.showerror("Processing failed", f"{job.title}\n\n{job.error}")
         self._update_queue_stats()
 
     def _clear_finished_jobs(self) -> None:
@@ -1937,7 +1937,7 @@ class EditAutomateApp(ctk.CTk):
             try:
                 fn()
             except Exception as exc:
-                err_msg = str(exc)
+                err_msg = format_user_error(exc)
                 self.after(0, lambda msg=err_msg: messagebox.showerror("Error", msg))
             finally:
                 self.after(0, lambda: (

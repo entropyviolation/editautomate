@@ -26,14 +26,21 @@ class LyricLine:
     end: float
 
 
-def _get_whisper():
+def _get_whisper(progress: ProgressCallback | None = None):
     """Load OpenAI Whisper model locally (free — no API key)."""
     global _WHISPER_MODEL
     if _WHISPER_MODEL is None:
         import whisper
 
-        device = get_torch_device()
-        _WHISPER_MODEL = whisper.load_model(_WHISPER_MODEL_NAME, device=str(device))
+        if progress:
+            progress(f"Loading Whisper model ({_WHISPER_MODEL_NAME})…", 0.68)
+        try:
+            device = get_torch_device()
+            _WHISPER_MODEL = whisper.load_model(_WHISPER_MODEL_NAME, device=str(device))
+        except Exception as exc:
+            from app.utils import format_user_error
+
+            raise RuntimeError(format_user_error(exc)) from exc
     return _WHISPER_MODEL
 
 
@@ -148,7 +155,7 @@ def transcribe_lyrics(
     progress: ProgressCallback = default_progress,
 ) -> list[LyricLine]:
     progress("Transcribing new song lyrics…", 0.70)
-    model = _get_whisper()
+    model = _get_whisper(progress)
     result = model.transcribe(
         str(audio_path),
         word_timestamps=True,

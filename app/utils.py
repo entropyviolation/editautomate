@@ -10,6 +10,49 @@ from typing import Callable
 
 ProgressCallback = Callable[[str, float], None]
 
+_HTTPS_CONFIGURED = False
+
+
+def configure_https_certs() -> None:
+    """Use certifi's CA bundle so HTTPS model downloads work on fresh Python installs."""
+    global _HTTPS_CONFIGURED
+    if _HTTPS_CONFIGURED:
+        return
+    _HTTPS_CONFIGURED = True
+    try:
+        import ssl
+        import certifi
+        import urllib.request
+
+        cafile = certifi.where()
+        ctx = ssl.create_default_context(cafile=cafile)
+        urllib.request.install_opener(
+            urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        )
+        ssl._create_default_https_context = lambda *args, **kwargs: ssl.create_default_context(
+            cafile=cafile
+        )
+    except Exception:
+        pass  # best effort — app may still work if system certs are fine
+
+
+def format_user_error(exc: Exception) -> str:
+    """Turn low-level download/SSL failures into actionable setup guidance."""
+    msg = str(exc)
+    lower = msg.lower()
+    if any(token in lower for token in ("ssl", "certificate", "cert verify", "urlopen error")):
+        return (
+            "HTTPS certificate error while downloading AI models (Whisper, EasyOCR, or LaMa).\n\n"
+            "First-time setup downloads model weights from the internet (~500MB–2GB).\n\n"
+            "Try:\n"
+            "  pip install -U certifi\n"
+            "  python scripts/download_models.py\n\n"
+            "On macOS with python.org Python, also run:\n"
+            "  open /Applications/Python*/Install\\ Certificates.command\n\n"
+            f"Details: {msg}"
+        )
+    return msg
+
 
 def default_progress(message: str, fraction: float) -> None:
     fraction = max(0.0, min(1.0, fraction))
