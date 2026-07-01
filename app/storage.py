@@ -134,6 +134,31 @@ class OverlayTweak:
 
 
 @dataclass
+class SongSnippet:
+    id: str
+    name: str
+    start: float
+    end: float | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "start": self.start,
+            "end": self.end,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> SongSnippet:
+        return cls(
+            id=d["id"],
+            name=d["name"],
+            start=float(d["start"]),
+            end=d.get("end"),
+        )
+
+
+@dataclass
 class SongRecord:
     id: str
     title: str
@@ -143,6 +168,7 @@ class SongRecord:
     bpm: float = 0.0
     snippet_start: float = 0.0
     snippet_end: float | None = None
+    snippets: list[SongSnippet] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -154,10 +180,23 @@ class SongRecord:
             "bpm": self.bpm,
             "snippet_start": self.snippet_start,
             "snippet_end": self.snippet_end,
+            "snippets": [s.to_dict() for s in self.snippets],
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> SongRecord:
+        snippets = [SongSnippet.from_dict(s) for s in d.get("snippets", [])]
+        snippet_start = float(d.get("snippet_start", 0))
+        snippet_end = d.get("snippet_end")
+        if not snippets and (snippet_start > 0 or snippet_end is not None):
+            snippets = [
+                SongSnippet(
+                    id=_new_id(),
+                    name="Saved snippet",
+                    start=snippet_start,
+                    end=snippet_end,
+                )
+            ]
         return cls(
             id=d["id"],
             title=d["title"],
@@ -165,9 +204,13 @@ class SongRecord:
             added_at=d["added_at"],
             lyrics=[_lyric_from_dict(l) for l in d.get("lyrics", [])],
             bpm=float(d.get("bpm", 0)),
-            snippet_start=float(d.get("snippet_start", 0)),
-            snippet_end=d.get("snippet_end"),
+            snippet_start=snippet_start,
+            snippet_end=snippet_end,
+            snippets=snippets,
         )
+
+    def get_snippet(self, snippet_id: str) -> SongSnippet | None:
+        return next((s for s in self.snippets if s.id == snippet_id), None)
 
 
 @dataclass

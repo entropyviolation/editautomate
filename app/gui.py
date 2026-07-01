@@ -10,16 +10,24 @@ import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 import customtkinter as ctk
 
-from app.audio import LyricLine, clip_lyrics_to_snippet, extract_audio_from_file, transcribe_lyrics
+from app.audio import (
+    LyricLine,
+    clip_lyrics_to_snippet,
+    extract_audio_from_file,
+    merge_lyrics_range,
+    transcribe_lyrics,
+)
 from app.beat_sync import analyze_audio_beats, extract_audio_snippet
 from app.lyrics_overlay import re_render_edit
 from app.pipeline import PipelineConfig, PipelineResult, SourcePipelineConfig, run_pipeline, run_source_pipeline
 from app.storage import Library, OverlayTweak
 from app.caption_timeline import CaptionTimeline
+from app.studio_preview import StudioPreview
+from app.video_preview import VideoPreview
 from app.fonts import TIKTOK_FONT_CANDIDATES
 from app.utils import ensure_dir, get_video_info, work_dir
 from app.waveform import WaveformSelector
@@ -92,13 +100,17 @@ class EditAutomateApp(ctk.CTk):
         self._selected_source_id: str | None = None
         self._selected_edit_id: str | None = None
         self._selected_song_lyrics: list[LyricLine] = []
+        self._selected_snippet_id: str | None = None
+        self._snippet_picker_values: list[str] = []
         self._jobs: dict[str, QueuedEdit] = {}
         self._job_order: list[str] = []
         self._source_jobs: dict[str, QueuedSource] = {}
         self._source_job_order: list[str] = []
+        self._preview_source_id: str | None = None
         self._studio_lyrics: list[LyricLine] = []
         self._studio_duration = 30.0
         self._studio_syncing = False
+        self._studio_font_style = None
 
         self._build_ui()
         self._refresh_songs_list()
@@ -455,23 +467,42 @@ class EditAutomateApp(ctk.CTk):
             right, text="SNIPPET — drag handles on waveform", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM,
         ).grid(row=3, column=0, sticky="nw", padx=16, pady=(0, 4))
 
+        snippet_row = ctk.CTkFrame(right, fg_color="transparent")
+        snippet_row.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 6))
+        snippet_row.grid_columnconfigure(0, weight=1)
+        self.snippet_picker = ctk.CTkOptionMenu(
+            snippet_row,
+            values=["(New selection)"],
+            command=self._on_snippet_picked,
+            fg_color=SURFACE,
+            button_color=BORDER,
+            button_hover_color=ACCENT_DIM,
+            dropdown_fg_color=SURFACE_RAISED,
+            dropdown_hover_color=BORDER,
+            text_color=TEXT,
+            font=ctk.CTkFont(size=12),
+            width=200,
+        )
+        self.snippet_picker.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._outline_btn(snippet_row, "Save Snippet", self._save_named_snippet, width=100).grid(row=0, column=1, padx=(0, 4))
+        self._outline_btn(snippet_row, "Delete", self._delete_snippet, width=70).grid(row=0, column=2)
+
         self.waveform = WaveformSelector(right, on_change=self._on_waveform_change)
-        self.waveform.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.waveform.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 8))
 
         ctk.CTkLabel(
             right, text="LYRICS FOR SNIPPET (timestamps relative to selection)", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM,
-        ).grid(row=5, column=0, sticky="nw", padx=16, pady=(0, 4))
+        ).grid(row=6, column=0, sticky="nw", padx=16, pady=(0, 4))
 
         self.lyrics_editor = ctk.CTkTextbox(
             right, height=180, font=ctk.CTkFont(family="Menlo", size=12), fg_color=LOG_BG,
             text_color=TEXT_MUTED, corner_radius=8, border_width=1, border_color=BORDER,
         )
-        self.lyrics_editor.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.lyrics_editor.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 8))
 
         btn_row = ctk.CTkFrame(right, fg_color="transparent")
-        btn_row.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 16))
+        btn_row.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 16))
         self._outline_btn(btn_row, "Transcribe Snippet", self._transcribe_selected_song).pack(side="left", padx=(0, 8))
-        self._accent_btn(btn_row, "Save Lyrics", self._save_song_lyrics).pack(side="left", padx=(0, 8))
         for secs, label in ((15, "15s"), (30, "30s"), (60, "60s")):
             self._outline_btn(
                 btn_row, label, lambda s=secs: self._apply_snippet_preset(s), width=52,
@@ -481,9 +512,10 @@ class EditAutomateApp(ctk.CTk):
     def _build_sources_tab(self) -> None:
         tab = self._scrollable_tab("Sources")
         tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=2)
 
         hdr = ctk.CTkFrame(tab, fg_color="transparent")
-        hdr.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 0))
+        hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 0))
         ctk.CTkLabel(
             hdr,
             text="Inpainted source files — TikTok edits with text removed, ready to remix",
@@ -494,7 +526,7 @@ class EditAutomateApp(ctk.CTk):
         self._outline_btn(hdr, "Refresh", self._refresh_sources_list, width=80).pack(side="right")
 
         add_form = ctk.CTkFrame(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1, border_color=BORDER)
-        add_form.grid(row=1, column=0, sticky="ew", padx=8, pady=8)
+        add_form.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
         add_form.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
@@ -532,7 +564,7 @@ class EditAutomateApp(ctk.CTk):
         ).grid(row=2, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 14))
 
         jobs_hdr = ctk.CTkFrame(tab, fg_color="transparent")
-        jobs_hdr.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 4))
+        jobs_hdr.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
         ctk.CTkLabel(
             jobs_hdr,
             text="IMPORTS",
@@ -545,7 +577,7 @@ class EditAutomateApp(ctk.CTk):
         self.source_jobs_frame = self._list_panel(
             tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1,
         )
-        self.source_jobs_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.source_jobs_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
         self._source_jobs_empty_label = ctk.CTkLabel(
             self.source_jobs_frame,
             text="Paste a link and hit Download — add as many as you want in parallel.",
@@ -554,18 +586,44 @@ class EditAutomateApp(ctk.CTk):
         )
         self._source_jobs_empty_label.pack(pady=12, padx=12)
 
+        library_col = ctk.CTkFrame(tab, fg_color="transparent")
+        library_col.grid(row=4, column=0, sticky="new", padx=(8, 4), pady=(0, 8))
+        library_col.grid_columnconfigure(0, weight=1)
+
         ctk.CTkLabel(
-            tab,
+            library_col,
             text="LIBRARY",
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color=TEXT_DIM,
             anchor="w",
-        ).grid(row=4, column=0, sticky="nw", padx=16, pady=(0, 4))
+        ).grid(row=0, column=0, sticky="nw", padx=8, pady=(0, 4))
 
         self.sources_list = self._list_panel(
-            tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1,
+            library_col, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1,
         )
-        self.sources_list.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.sources_list.grid(row=1, column=0, sticky="ew", padx=0, pady=(0, 0))
+
+        preview_col = ctk.CTkFrame(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1, border_color=BORDER)
+        preview_col.grid(row=4, column=1, sticky="new", padx=(4, 8), pady=(0, 8))
+        preview_col.grid_columnconfigure(0, weight=1)
+
+        self.source_preview_title = ctk.CTkLabel(
+            preview_col, text="Select a source", font=ctk.CTkFont(size=16, weight="bold"), text_color=TEXT,
+        )
+        self.source_preview_title.grid(row=0, column=0, sticky="w", padx=16, pady=(16, 4))
+
+        self.source_preview_meta = ctk.CTkLabel(
+            preview_col, text="", font=ctk.CTkFont(size=12), text_color=TEXT_DIM, wraplength=420, justify="left",
+        )
+        self.source_preview_meta.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 8))
+
+        self.source_video_preview = VideoPreview(preview_col)
+        self.source_video_preview.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        preview_actions = ctk.CTkFrame(preview_col, fg_color="transparent")
+        preview_actions.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+        self._outline_btn(preview_actions, "Use in Create", self._use_preview_source_in_create, width=120).pack(side="left", padx=(0, 8))
+        self._outline_btn(preview_actions, "Reveal in Finder", self._reveal_preview_source, width=130).pack(side="left")
 
     def _build_studio_tab(self) -> None:
         tab = self._scrollable_tab("Studio")
@@ -608,20 +666,24 @@ class EditAutomateApp(ctk.CTk):
         self.studio_edit_pick.set("(No edits yet)")
         self.studio_edit_pick.pack(side="left", padx=(10, 0))
 
+        self.studio_preview = StudioPreview(body, on_time_change=self._on_studio_preview_seek)
+        self.studio_preview.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+
         self.studio_timeline = CaptionTimeline(
             body,
             on_select=self._on_studio_caption_select,
             on_change=self._on_studio_timeline_change,
+            on_seek=self._on_studio_timeline_seek,
         )
-        self.studio_timeline.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+        self.studio_timeline.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
 
         tl_tools = ctk.CTkFrame(body, fg_color="transparent")
-        tl_tools.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+        tl_tools.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
         self._outline_btn(tl_tools, "+ Add Caption", self._studio_add_caption, width=110).pack(side="left", padx=(0, 8))
         self._outline_btn(tl_tools, "Delete", self._studio_delete_caption, width=80).pack(side="left")
         ctk.CTkLabel(
             tl_tools,
-            text="Drag blocks to move · drag edges to trim · click to select",
+            text="Drag blocks to move · drag edges to trim · click timeline or preview to scrub",
             font=ctk.CTkFont(size=11),
             text_color=TEXT_DIM,
         ).pack(side="right")
@@ -677,7 +739,12 @@ class EditAutomateApp(ctk.CTk):
             )
             lbl = ctk.CTkLabel(style, text=str(default), font=ctk.CTkFont(size=11), text_color=TEXT_DIM, width=44)
             lbl.grid(row=row, column=2, sticky="e", padx=16)
-            slider = ctk.CTkSlider(style, from_=from_, to=to_, command=lambda v, l=lbl: l.configure(text=f"{int(float(v))}"))
+            slider = ctk.CTkSlider(
+                style,
+                from_=from_,
+                to=to_,
+                command=lambda v, l=lbl: (l.configure(text=f"{int(float(v))}"), self._studio_style_changed()),
+            )
             slider.set(default)
             slider.grid(row=row, column=1, sticky="ew", padx=8, pady=6)
             setattr(self, attr, slider)
@@ -693,6 +760,7 @@ class EditAutomateApp(ctk.CTk):
         )
         self.tweak_font.set("Arial Narrow")
         self.tweak_font.grid(row=row, column=1, columnspan=2, sticky="ew", padx=16, pady=6)
+        self.tweak_font.configure(command=lambda _v: self._studio_style_changed())
         row += 1
 
         self.tweak_stroke_var = ctk.BooleanVar(value=True)
@@ -700,6 +768,7 @@ class EditAutomateApp(ctk.CTk):
             style, text="Text outline", variable=self.tweak_stroke_var,
             font=ctk.CTkFont(size=12), text_color=TEXT_MUTED,
             fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER, checkmark_color=BG,
+            command=self._studio_style_changed,
         ).grid(row=row, column=0, columnspan=3, sticky="w", padx=16, pady=(4, 14))
 
         self.edits_list = self._list_panel(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1)
@@ -766,6 +835,60 @@ class EditAutomateApp(ctk.CTk):
 
     # --- Songs tab ---
 
+    def _format_snippet_label(self, name: str, start: float, end: float | None) -> str:
+        end_s = f"{end:.0f}s" if end is not None else "end"
+        return f"{name} ({start:.0f}s–{end_s})"
+
+    def _refresh_snippet_picker(self, song: object | None = None) -> None:
+        from app.storage import SongRecord
+
+        values = ["(New selection)"]
+        self._snippet_picker_values = values
+        if song is not None:
+            assert isinstance(song, SongRecord)
+            for snippet in song.snippets:
+                label = self._format_snippet_label(snippet.name, snippet.start, snippet.end)
+                values.append(label)
+                self._snippet_picker_values.append(snippet.id)
+        self.snippet_picker.configure(values=values)
+        if self._selected_snippet_id and song is not None:
+            assert isinstance(song, SongRecord)
+            snippet = song.get_snippet(self._selected_snippet_id)
+            if snippet:
+                label = self._format_snippet_label(snippet.name, snippet.start, snippet.end)
+                self.snippet_picker.set(label)
+                return
+        self.snippet_picker.set("(New selection)")
+
+    def _load_snippet_range(self, start: float, end: float | None) -> None:
+        if not self._selected_song_id:
+            return
+        song = self._library.get_song(self._selected_song_id)
+        if not song or not Path(song.path).exists():
+            return
+        self.waveform.load_audio(Path(song.path), start, end)
+        self._refresh_snippet_lyrics()
+
+    def _on_snippet_picked(self, choice: str) -> None:
+        if choice == "(New selection)":
+            self._selected_snippet_id = None
+            return
+        idx = self.snippet_picker.cget("values").index(choice) if choice in self.snippet_picker.cget("values") else -1
+        if idx <= 0 or idx >= len(self._snippet_picker_values):
+            self._selected_snippet_id = None
+            return
+        snippet_id = self._snippet_picker_values[idx]
+        if not self._selected_song_id:
+            return
+        song = self._library.get_song(self._selected_song_id)
+        if not song:
+            return
+        snippet = song.get_snippet(snippet_id)
+        if not snippet:
+            return
+        self._selected_snippet_id = snippet.id
+        self._load_snippet_range(snippet.start, snippet.end)
+
     def _apply_snippet_preset(self, seconds: float) -> None:
         if not self._selected_song_id:
             return
@@ -783,7 +906,12 @@ class EditAutomateApp(ctk.CTk):
         for song in songs:
             btn = ctk.CTkButton(
                 self.songs_list,
-                text=f"{song.title}\n{len(song.lyrics)} lyric lines · {song.bpm:.0f} BPM" if song.bpm else song.title,
+                text=(
+                    f"{song.title}\n{len(song.snippets)} snippet{'s' if len(song.snippets) != 1 else ''}"
+                    f" · {len(song.lyrics)} lyric lines · {song.bpm:.0f} BPM"
+                    if song.bpm
+                    else f"{song.title}\n{len(song.snippets)} saved snippet{'s' if len(song.snippets) != 1 else ''}"
+                ),
                 anchor="w",
                 height=52,
                 fg_color=SURFACE_RAISED,
@@ -803,8 +931,15 @@ class EditAutomateApp(ctk.CTk):
         self.song_bpm_label.configure(text=f"{song.bpm:.0f} BPM" if song.bpm else "BPM not analyzed yet")
 
         self._selected_song_lyrics = list(song.lyrics)
-        snippet_start = song.snippet_start
-        snippet_end = song.snippet_end
+        if song.snippets:
+            first = song.snippets[0]
+            self._selected_snippet_id = first.id
+            snippet_start, snippet_end = first.start, first.end
+        else:
+            self._selected_snippet_id = None
+            snippet_start = song.snippet_start
+            snippet_end = song.snippet_end
+        self._refresh_snippet_picker(song)
         if Path(song.path).exists():
             self.waveform.load_audio(Path(song.path), snippet_start, snippet_end)
         else:
@@ -812,6 +947,8 @@ class EditAutomateApp(ctk.CTk):
         self._refresh_snippet_lyrics()
 
     def _on_waveform_change(self, start: float, end: float) -> None:
+        self._selected_snippet_id = None
+        self.snippet_picker.set("(New selection)")
         self._refresh_snippet_lyrics()
 
     def _refresh_snippet_lyrics(self) -> None:
@@ -858,9 +995,7 @@ class EditAutomateApp(ctk.CTk):
         self._run_bg(f"Uploading {Path(path).name}…", lambda: self._import_song(Path(path)))
 
     def _import_song(self, path: Path) -> None:
-        tmp = self._work / "upload_transcribe.mp3"
-        extract_audio_from_file(path, tmp)
-        lyrics = transcribe_lyrics(tmp, self._set_progress)
+        lyrics = transcribe_lyrics(path, self._set_progress)
         beat = analyze_audio_beats(path, self._set_progress)
         record = self._library.add_song(path, lyrics=lyrics, bpm=beat.bpm, title=path.stem)
         self.after(0, lambda r=record: (self._refresh_songs_list(), self._select_song(r), self._log(f"Added song: {r.title}")))
@@ -872,26 +1007,36 @@ class EditAutomateApp(ctk.CTk):
         song = self._library.get_song(self._selected_song_id)
         if not song:
             return
-        self._run_bg("Transcribing…", lambda: self._do_transcribe(song))
+        start, end = self.waveform.get_selection()
+        self._run_bg("Transcribing…", lambda: self._do_transcribe(song, start, end))
 
-    def _do_transcribe(self, song: object) -> None:
+    def _do_transcribe(self, song: object, start: float, end: float) -> None:
         from app.storage import SongRecord
 
         assert isinstance(song, SongRecord)
-        start, end = self.waveform.get_selection()
         tmp = self._work / "retranscribe.mp3"
         extract_audio_snippet(Path(song.path), tmp, start, end)
         lyrics = transcribe_lyrics(tmp, self._set_progress)
         for line in lyrics:
             line.start += start
             line.end += start
-        song.lyrics = lyrics
+        song.lyrics = merge_lyrics_range(song.lyrics, lyrics, start, end)
         beat = analyze_audio_beats(Path(song.path), self._set_progress)
         song.bpm = beat.bpm
         self._library.update_song(song)
-        self.after(0, lambda s=song: (setattr(self, "_selected_song_lyrics", list(s.lyrics)), self._select_song(s), self._refresh_songs_list()))
+        self.after(0, lambda s=song: self._on_transcribe_complete(s))
 
-    def _save_song_lyrics(self) -> None:
+    def _on_transcribe_complete(self, song: object) -> None:
+        from app.storage import SongRecord
+
+        assert isinstance(song, SongRecord)
+        self._selected_song_lyrics = list(song.lyrics)
+        self.song_bpm_label.configure(text=f"{song.bpm:.0f} BPM" if song.bpm else "BPM not analyzed yet")
+        self._refresh_songs_list()
+        self._refresh_snippet_lyrics()
+        self._log(f"Transcribed snippet for {song.title}")
+
+    def _save_named_snippet(self) -> None:
         if not self._selected_song_id:
             messagebox.showinfo("No song", "Select a song first.")
             return
@@ -899,13 +1044,60 @@ class EditAutomateApp(ctk.CTk):
         if not song:
             return
         snippet_start, snippet_end = self.waveform.get_selection()
-        song.lyrics = self._parse_lyrics_editor(snippet_start)
+        edited = self._parse_lyrics_editor(snippet_start)
+        song.lyrics = merge_lyrics_range(song.lyrics, edited, snippet_start, snippet_end)
+        self._selected_song_lyrics = list(song.lyrics)
+
+        existing = song.get_snippet(self._selected_snippet_id) if self._selected_snippet_id else None
+        if existing:
+            name = existing.name
+        else:
+            default_name = f"Snippet {len(song.snippets) + 1}"
+            name = simpledialog.askstring("Save snippet", "Name this snippet:", initialvalue=default_name, parent=self)
+            if not name or not name.strip():
+                return
+            name = name.strip()
+            existing = None
+
+        if existing:
+            existing.start = snippet_start
+            existing.end = snippet_end
+        else:
+            from app.storage import SongSnippet
+
+            new_snippet = SongSnippet(id=uuid.uuid4().hex[:12], name=name, start=snippet_start, end=snippet_end)
+            song.snippets.append(new_snippet)
+            self._selected_snippet_id = new_snippet.id
+
         song.snippet_start = snippet_start
         song.snippet_end = snippet_end
-        self._selected_song_lyrics = list(song.lyrics)
         self._library.update_song(song)
-        self._log(f"Saved lyrics for {song.title}")
-        messagebox.showinfo("Saved", "Lyrics and snippet range saved.")
+        self._refresh_snippet_picker(song)
+        self._refresh_snippet_lyrics()
+        self._log(f"Saved snippet '{name}' for {song.title}")
+        messagebox.showinfo("Saved", f"Snippet '{name}' saved with lyrics.")
+
+    def _delete_snippet(self) -> None:
+        if not self._selected_song_id or not self._selected_snippet_id:
+            messagebox.showinfo("No snippet", "Select a saved snippet to delete.")
+            return
+        song = self._library.get_song(self._selected_song_id)
+        if not song:
+            return
+        snippet = song.get_snippet(self._selected_snippet_id)
+        if not snippet:
+            return
+        if not messagebox.askyesno("Delete snippet", f"Delete snippet '{snippet.name}'?"):
+            return
+        song.snippets = [s for s in song.snippets if s.id != snippet.id]
+        self._selected_snippet_id = None
+        if song.snippets:
+            song.snippet_start = song.snippets[0].start
+            song.snippet_end = song.snippets[0].end
+        self._library.update_song(song)
+        self._refresh_snippet_picker(song)
+        self.snippet_picker.set("(New selection)")
+        self._log(f"Deleted snippet '{snippet.name}' from {song.title}")
 
     def _use_song_in_create(self) -> None:
         if not self._selected_song_id:
@@ -917,14 +1109,24 @@ class EditAutomateApp(ctk.CTk):
         self.tabs.set("Create")
         self.audio_entry.delete(0, "end")
         self.audio_entry.insert(0, song.path)
-        snippet_end = song.snippet_end if song.snippet_end else "?"
+        snippet_start, snippet_end = self.waveform.get_selection()
+        song.snippet_start = snippet_start
+        song.snippet_end = snippet_end
+        self._library.update_song(song)
+        end_label = f"{snippet_end:.1f}s" if snippet_end else "end"
+        snippet_name = ""
+        if self._selected_snippet_id:
+            snip = song.get_snippet(self._selected_snippet_id)
+            if snip:
+                snippet_name = f" ({snip.name})"
         self._log(
-            f"Song '{song.title}' loaded — snippet {song.snippet_start:.1f}s–{snippet_end}s · hit Generate Edit"
+            f"Song '{song.title}'{snippet_name} loaded — snippet {snippet_start:.1f}s–{end_label} · hit Generate Edit"
         )
 
     # --- Sources tab ---
 
     def _refresh_sources_list(self) -> None:
+        self.source_video_preview.stop()
         for w in self.sources_list.winfo_children():
             w.destroy()
         sources = self._library.list_sources()
@@ -932,6 +1134,10 @@ class EditAutomateApp(ctk.CTk):
         self.source_pick.configure(values=self._source_options)
 
         if not sources:
+            self._preview_source_id = None
+            self.source_video_preview.unload()
+            self.source_preview_title.configure(text="Select a source")
+            self.source_preview_meta.configure(text="")
             ctk.CTkLabel(
                 self.sources_list,
                 text="No sources yet — paste a TikTok link above to download and remove text.",
@@ -939,31 +1145,99 @@ class EditAutomateApp(ctk.CTk):
             ).pack(pady=40)
             return
 
+        preview_src = next((s for s in sources if s.id == self._preview_source_id), None)
+        if preview_src is None:
+            preview_src = sources[0]
+            self._preview_source_id = preview_src.id
+
         for src in sources:
-            card = ctk.CTkFrame(self.sources_list, fg_color=SURFACE, corner_radius=10, border_width=1, border_color=BORDER)
+            selected = src.id == self._preview_source_id
+            card = ctk.CTkFrame(
+                self.sources_list,
+                fg_color=ACCENT_DIM if selected else SURFACE,
+                corner_radius=10,
+                border_width=1,
+                border_color=ACCENT if selected else BORDER,
+                cursor="hand2",
+            )
             card.pack(fill="x", padx=8, pady=6)
             card.grid_columnconfigure(0, weight=1)
 
-            ctk.CTkLabel(card, text=src.title, font=ctk.CTkFont(size=14, weight="bold"), text_color=TEXT).grid(
-                row=0, column=0, sticky="w", padx=14, pady=(12, 2)
+            title_lbl = ctk.CTkLabel(
+                card, text=src.title, font=ctk.CTkFont(size=14, weight="bold"),
+                text_color=TEXT, cursor="hand2",
             )
-            ctk.CTkLabel(
-                card, text=src.tiktok_url or "Local file", font=ctk.CTkFont(size=11), text_color=TEXT_DIM, wraplength=500,
-            ).grid(row=1, column=0, sticky="w", padx=14)
+            title_lbl.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+            url_lbl = ctk.CTkLabel(
+                card, text=src.tiktok_url or "Local file", font=ctk.CTkFont(size=11),
+                text_color=TEXT_DIM, wraplength=280, cursor="hand2",
+            )
+            url_lbl.grid(row=1, column=0, sticky="w", padx=14)
             font_label = (
                 f"Font: {src.font_style.dominant_font}"
                 if src.font_style.font_identified
                 else f"Font: {src.font_style.dominant_font} (auto fallback)"
             )
-            ctk.CTkLabel(
+            meta_lbl = ctk.CTkLabel(
                 card, text=f"Added {src.added_at[:10]} · {font_label}",
-                font=ctk.CTkFont(size=11), text_color=TEXT_DIM,
-            ).grid(row=2, column=0, sticky="w", padx=14, pady=(2, 12))
+                font=ctk.CTkFont(size=11), text_color=TEXT_DIM, cursor="hand2",
+            )
+            meta_lbl.grid(row=2, column=0, sticky="w", padx=14, pady=(2, 12))
 
             btns = ctk.CTkFrame(card, fg_color="transparent")
             btns.grid(row=0, column=1, rowspan=3, padx=14, pady=12)
+            self._outline_btn(btns, "Preview", lambda s=src: self._select_source_preview(s), width=80).pack(pady=2)
             self._outline_btn(btns, "Use in Create", lambda s=src: self._use_source_in_create(s), width=110).pack(pady=2)
             self._outline_btn(btns, "Reveal", lambda s=src: self._reveal_path(Path(s.path)), width=110).pack(pady=2)
+
+            for widget in (card, title_lbl, url_lbl, meta_lbl):
+                widget.bind("<Button-1>", lambda _e, s=src: self._select_source_preview(s))
+
+        self._select_source_preview(preview_src, refresh_list=False)
+
+    def _select_source_preview(self, src: object, *, refresh_list: bool = True) -> None:
+        from app.storage import SourceRecord
+
+        assert isinstance(src, SourceRecord)
+        if refresh_list and self._preview_source_id != src.id:
+            self._preview_source_id = src.id
+            self._refresh_sources_list()
+            return
+
+        self._preview_source_id = src.id
+        self.source_preview_title.configure(text=src.title)
+        path = Path(src.path)
+        font_label = (
+            src.font_style.dominant_font
+            if src.font_style.font_identified
+            else f"{src.font_style.dominant_font} (auto fallback)"
+        )
+        meta_parts = [src.tiktok_url or "Local file", f"Font: {font_label}"]
+        duration = 0.0
+        if path.exists():
+            try:
+                _w, _h, _fps, duration = get_video_info(path)
+                meta_parts.append(f"{duration:.1f}s · {_w}×{_h}")
+            except (RuntimeError, StopIteration, KeyError, ValueError):
+                meta_parts.append(path.name)
+        else:
+            meta_parts.append("File missing")
+        self.source_preview_meta.configure(text=" · ".join(meta_parts))
+        self.source_video_preview.load(path if path.exists() else None, duration=duration)
+
+    def _use_preview_source_in_create(self) -> None:
+        if not self._preview_source_id:
+            return
+        src = self._library.get_source(self._preview_source_id)
+        if src:
+            self._use_source_in_create(src)
+
+    def _reveal_preview_source(self) -> None:
+        if not self._preview_source_id:
+            return
+        src = self._library.get_source(self._preview_source_id)
+        if src:
+            self._reveal_path(Path(src.path))
 
     def _add_source(self) -> None:
         url = self.source_url_entry.get().strip()
@@ -1168,7 +1442,10 @@ class EditAutomateApp(ctk.CTk):
         self._selected_edit_id = edit.id
         self._studio_lyrics = [LyricLine(text=l.text, start=l.start, end=l.end) for l in edit.lyrics]
         self._studio_duration = self._studio_edit_duration(edit)
+        self._studio_font_style = edit.font_style
         self.studio_title.configure(text=f"{edit.title} · {len(self._studio_lyrics)} captions")
+
+        self._studio_syncing = True
         self.studio_timeline.load(self._studio_lyrics, self._studio_duration)
 
         t = edit.tweak
@@ -1183,8 +1460,45 @@ class EditAutomateApp(ctk.CTk):
         self.tweak_font.set(t.font_name or edit.font_style.dominant_font)
         self.tweak_stroke_var.set(t.has_stroke if t.has_stroke is not None else edit.font_style.has_stroke)
 
+        playhead = self.studio_timeline.playhead_time()
+        self.studio_preview.load(
+            Path(edit.with_audio_path),
+            self._studio_duration,
+            self._studio_lyrics,
+            edit.font_style,
+            self._current_tweak(),
+            time_sec=playhead,
+        )
+        self._studio_syncing = False
+
         idx = self.studio_timeline.selected_index()
         self._fill_studio_caption_fields(idx)
+
+    def _studio_style_changed(self, *_args: object) -> None:
+        self._studio_refresh_preview()
+
+    def _studio_refresh_preview(self) -> None:
+        if self._studio_font_style is None:
+            return
+        self.studio_preview.set_overlay(
+            self._studio_lyrics,
+            self._studio_font_style,
+            self._current_tweak(),
+        )
+
+    def _on_studio_timeline_seek(self, t: float) -> None:
+        if self._studio_syncing:
+            return
+        self._studio_syncing = True
+        self.studio_preview.set_time(t, notify=False)
+        self._studio_syncing = False
+
+    def _on_studio_preview_seek(self, t: float) -> None:
+        if self._studio_syncing:
+            return
+        self._studio_syncing = True
+        self.studio_timeline.set_playhead(t, notify=False)
+        self._studio_syncing = False
 
     def _fill_studio_caption_fields(self, index: int | None) -> None:
         self._studio_syncing = True
@@ -1215,6 +1529,7 @@ class EditAutomateApp(ctk.CTk):
         self._studio_lyrics = lyrics
         idx = self.studio_timeline.selected_index()
         self._fill_studio_caption_fields(idx)
+        self._studio_refresh_preview()
 
     def _studio_caption_text_changed(self) -> None:
         if self._studio_syncing:
@@ -1224,6 +1539,7 @@ class EditAutomateApp(ctk.CTk):
             return
         self._studio_lyrics[idx].text = self.studio_caption_text.get().strip()
         self.studio_timeline.set_lyrics(self._studio_lyrics, notify=False)
+        self._studio_refresh_preview()
 
     def _studio_timing_changed(self) -> None:
         if self._studio_syncing:
@@ -1244,6 +1560,7 @@ class EditAutomateApp(ctk.CTk):
         self._studio_lyrics[idx].end = end
         self.studio_timeline.set_lyrics(self._studio_lyrics, notify=False)
         self._fill_studio_caption_fields(idx)
+        self._studio_refresh_preview()
 
     def _studio_add_caption(self) -> None:
         if not self._selected_edit_id:
@@ -1379,8 +1696,11 @@ class EditAutomateApp(ctk.CTk):
         for song in self._library.list_songs():
             if Path(song.path).resolve() == audio.resolve():
                 song_id = song.id
-                snippet_start = song.snippet_start
-                snippet_end = song.snippet_end
+                if self._selected_song_id == song.id:
+                    snippet_start, snippet_end = self.waveform.get_selection()
+                else:
+                    snippet_start = song.snippet_start
+                    snippet_end = song.snippet_end
                 if song.lyrics:
                     lyrics_override = song.lyrics
                 break

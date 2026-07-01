@@ -17,7 +17,7 @@ from app.fonts import (
     TIKTOK_FONT_CANDIDATES,
     font_available,
 )
-from app.utils import ProgressCallback, default_progress, get_video_info
+from app.utils import ProgressCallback, default_progress, get_torch_device, get_video_info
 
 
 @dataclass
@@ -59,7 +59,9 @@ class FontStyle:
 def _reader():
     import easyocr
 
-    return easyocr.Reader(["en"], gpu=False, verbose=False)
+    device = get_torch_device()
+    use_gpu = device.type in ("cuda", "mps")
+    return easyocr.Reader(["en"], gpu=use_gpu, verbose=False)
 
 
 _READER = None

@@ -62,3 +62,26 @@ def work_dir(base: Path | None = None) -> Path:
     """Default workspace for downloads, temp renders, and the song/source/edit library."""
     root = base or Path.cwd() / ".editautomate_cache"
     return ensure_dir(root)
+
+
+def get_torch_device():
+    """Best available PyTorch device: CUDA GPU, Apple MPS, or CPU."""
+    import torch
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def torch_acceleration_label() -> str:
+    """Human-readable label for the active PyTorch backend."""
+    import torch
+
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        return f"CUDA ({name})"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "Apple GPU (MPS)"
+    return "CPU"

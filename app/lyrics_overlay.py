@@ -268,6 +268,27 @@ def _active_lyric(time_sec: float, lyrics: list[LyricLine]) -> str:
     return ""
 
 
+def active_lyric_at_time(time_sec: float, lyrics: list[LyricLine]) -> str:
+    """Return caption text visible at ``time_sec``, or empty string."""
+    return _active_lyric(time_sec, lyrics)
+
+
+def render_studio_preview_frame(
+    frame: np.ndarray,
+    time_sec: float,
+    lyrics: list[LyricLine],
+    style: FontStyle,
+    width: int,
+    height: int,
+    tweak: OverlayTweak | None = None,
+) -> np.ndarray:
+    """Draw the active caption onto a single BGR frame for live studio preview."""
+    text = _active_lyric(time_sec, lyrics)
+    if not text:
+        return frame
+    return _draw_lyric_on_frame(frame, text, style, width, height, tweak=tweak)
+
+
 def overlay_lyrics(
     video_path: Path,
     lyrics: list[LyricLine],

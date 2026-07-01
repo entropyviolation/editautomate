@@ -43,11 +43,13 @@ class CaptionTimeline(ctk.CTkFrame):
         master: object,
         on_select: Callable[[int | None], None] | None = None,
         on_change: Callable[[list[LyricLine]], None] | None = None,
+        on_seek: Callable[[float], None] | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(master, fg_color=_SURFACE_RAISED, corner_radius=10, border_width=1, border_color=_BORDER, **kwargs)
         self._on_select = on_select
         self._on_change = on_change
+        self._on_seek = on_seek
         self._lyrics: list[LyricLine] = []
         self._duration = 30.0
         self._selected: int | None = None
@@ -67,6 +69,8 @@ class CaptionTimeline(ctk.CTkFrame):
             font=ctk.CTkFont(size=10, weight="bold"),
             text_color=_TEXT_DIM,
         ).pack(side="left")
+        self.playhead_label = ctk.CTkLabel(hdr, text="@ 0.0s", font=ctk.CTkFont(size=11), text_color=_ACCENT)
+        self.playhead_label.pack(side="right", padx=(0, 10))
         self.duration_label = ctk.CTkLabel(hdr, text="0:00", font=ctk.CTkFont(size=11), text_color=_TEXT_MUTED)
         self.duration_label.pack(side="right")
 
@@ -84,6 +88,7 @@ class CaptionTimeline(ctk.CTkFrame):
         self._playhead = self._lyrics[0].start if self._lyrics else 0.0
         self.duration_label.configure(text=f"Total {_fmt_time(self._duration)}")
         self._redraw()
+        self._notify_seek()
         if self._on_select and self._selected is not None:
             self._on_select(self._selected)
 
@@ -108,15 +113,26 @@ class CaptionTimeline(ctk.CTkFrame):
         if index is not None:
             self._playhead = self._lyrics[index].start
         self._redraw()
+        self._notify_seek()
         if self._on_select:
             self._on_select(index)
 
     def selected_index(self) -> int | None:
         return self._selected
 
-    def set_playhead(self, t: float) -> None:
+    def playhead_time(self) -> float:
+        return self._playhead
+
+    def set_playhead(self, t: float, *, notify: bool = True) -> None:
         self._playhead = max(0.0, min(self._duration, t))
         self._redraw()
+        if notify and self._on_seek:
+            self._on_seek(self._playhead)
+
+    def _notify_seek(self) -> None:
+        self.playhead_label.configure(text=f"@ {_fmt_time(self._playhead)}")
+        if self._on_seek:
+            self._on_seek(self._playhead)
 
     def _time_to_x(self, t: float) -> float:
         w = max(1, self.canvas.winfo_width() - TRACK_PAD * 2)
@@ -154,12 +170,14 @@ class CaptionTimeline(ctk.CTkFrame):
         if not self._lyrics:
             self._playhead = self._x_to_time(event.x)
             self._redraw()
+            self._notify_seek()
             return
         mode, idx = self._hit_test(event.x, event.y)
         t = self._x_to_time(event.x)
         if mode == "seek" or idx is None:
             self._playhead = t
             self._redraw()
+            self._notify_seek()
             return
         self._drag_mode = mode
         self._drag_index = idx
@@ -213,6 +231,7 @@ class CaptionTimeline(ctk.CTkFrame):
 
         self._playhead = line.start
         self._redraw()
+        self._notify_seek()
 
     def _on_release(self, _event: tk.Event) -> None:
         if self._drag_mode and not self._suppress_notify and self._on_change:
@@ -259,3 +278,4 @@ class CaptionTimeline(ctk.CTkFrame):
         px = self._time_to_x(self._playhead)
         c.create_line(px, 0, px, h, fill=_ACCENT, width=2)
         c.create_polygon(px - 5, 0, px + 5, 0, px, 8, fill=_ACCENT, outline="")
+        self.playhead_label.configure(text=f"@ {_fmt_time(self._playhead)}")

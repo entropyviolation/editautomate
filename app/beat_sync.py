@@ -435,12 +435,13 @@ def extract_audio_snippet(
     start: float,
     end: float | None = None,
 ) -> Path:
-    """Extract a time range from an audio file."""
-    args = ["-i", str(audio_path)]
+    """Extract a time range from an audio file (output timeline starts at 0)."""
+    args: list[str] = []
     if start > 0:
         args.extend(["-ss", str(start)])
+    args.extend(["-i", str(audio_path)])
     if end is not None:
-        args.extend(["-to", str(end)])
+        args.extend(["-t", str(max(0.01, end - start))])
     args.extend(["-c:a", "libmp3lame", "-q:a", "0", str(output_path)])
     run_ffmpeg(args)
     return output_path

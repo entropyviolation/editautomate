@@ -64,6 +64,8 @@ class WaveformSelector(ctk.CTkFrame):
         self._drag_mode: str | None = None
         self._drag_anchor = 0.0
         self._preview_proc: subprocess.Popen | None = None
+        self._preview_poll_id: str | None = None
+        self._preview_playing = False
 
         self.canvas = tk.Canvas(self, height=96, bg=_BG, highlightthickness=0, cursor="hand2")
         self.canvas.pack(fill="x", padx=10, pady=(10, 6))
@@ -92,12 +94,13 @@ class WaveformSelector(ctk.CTkFrame):
             hover_color="#14554a",
             text_color=_ACCENT,
             font=ctk.CTkFont(size=12, weight="bold"),
-            command=self._play_preview,
+            command=self._toggle_preview,
             state="disabled",
         )
         self.preview_btn.pack(side="right")
 
     def load_audio(self, path: Path, start: float = 0.0, end: float | None = None) -> None:
+        self._stop_preview()
         self._audio_path = path
         if path.exists():
             try:
@@ -234,8 +237,11 @@ class WaveformSelector(ctk.CTkFrame):
         self._redraw()
 
     def _on_release(self, _event: tk.Event) -> None:
-        if self._drag_mode and self._on_change:
-            self._on_change(self._start, self._end)
+        if self._drag_mode:
+            if self._preview_playing:
+                self._stop_preview()
+            if self._on_change:
+                self._on_change(self._start, self._end)
         self._drag_mode = None
 
     def _redraw(self) -> None:
@@ -276,12 +282,36 @@ class WaveformSelector(ctk.CTkFrame):
             c.create_rectangle(x - hw, 0, x + hw, h, fill=_HANDLE, outline=_TEXT)
             c.create_text(x, h - 10, text="◆", fill=_TEXT, font=("Arial", 8))
 
-    def _play_preview(self) -> None:
-        if not self._audio_path or not self._audio_path.exists():
-            return
+    def _set_preview_state(self, playing: bool) -> None:
+        self._preview_playing = playing
+        self.preview_btn.configure(text="⏸  Pause" if playing else "▶  Preview")
+
+    def _stop_preview(self) -> None:
+        if self._preview_poll_id is not None:
+            self.after_cancel(self._preview_poll_id)
+            self._preview_poll_id = None
         if self._preview_proc and self._preview_proc.poll() is None:
             self._preview_proc.terminate()
+            try:
+                self._preview_proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self._preview_proc.kill()
+        self._preview_proc = None
+        self._set_preview_state(False)
+
+    def _poll_preview(self) -> None:
+        if self._preview_proc is None or self._preview_proc.poll() is not None:
             self._preview_proc = None
+            self._preview_poll_id = None
+            self._set_preview_state(False)
+            return
+        self._preview_poll_id = self.after(200, self._poll_preview)
+
+    def _toggle_preview(self) -> None:
+        if not self._audio_path or not self._audio_path.exists():
+            return
+        if self._preview_playing:
+            self._stop_preview()
             return
 
         tmp = Path(tempfile.gettempdir()) / "editautomate_preview.mp3"
@@ -294,3 +324,5 @@ class WaveformSelector(ctk.CTkFrame):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+        self._set_preview_state(True)
+        self._poll_preview()

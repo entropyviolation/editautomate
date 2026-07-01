@@ -87,7 +87,7 @@ TikTok URL → download (best quality)
 
 ## Tips
 
-- Processing time depends on video length and whether LaMa runs on CPU vs GPU.
+- On Apple Silicon or NVIDIA GPUs, LaMa inpainting and OCR automatically use your GPU (MPS/CUDA). Text is inpainted on a tight crop around captions when possible for extra speed without changing quality.
 - For best lyric font match, use TikToks with clear bold on-screen text.
 - Output is saved as high-quality MP4 (H.264, slow preset, CRF 17–18).
 
@@ -96,6 +96,6 @@ TikTok URL → download (best quality)
 | Issue | Fix |
 |-------|-----|
 | `ffmpeg not found` | Install ffmpeg and restart terminal |
-| Slow inpainting | Normal on CPU; shorter clips process faster |
+| Slow inpainting | Ensure PyTorch is installed; Apple Silicon and NVIDIA GPUs are used automatically. Shorter clips still process faster. |
 | Wrong font | Install Arial Black / Impact; app tries common TikTok fonts |
 | Download fails | Check URL is public; update yt-dlp: `pip install -U yt-dlp` |
