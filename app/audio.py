@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.utils import ProgressCallback, default_progress, get_torch_device, get_video_info, run_ffmpeg
+from app.utils import ProgressCallback, default_progress, get_video_info, get_whisper_device, run_ffmpeg
 
 _WHISPER_MODEL = None
 _WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "small")
@@ -29,13 +29,19 @@ class LyricLine:
 def _get_whisper(progress: ProgressCallback | None = None):
     """Load OpenAI Whisper model locally (free — no API key)."""
     global _WHISPER_MODEL
+    if _WHISPER_MODEL is not None:
+        try:
+            if next(_WHISPER_MODEL.parameters()).device.type == "mps":
+                _WHISPER_MODEL = None
+        except StopIteration:
+            pass
     if _WHISPER_MODEL is None:
         import whisper
 
         if progress:
             progress(f"Loading Whisper model ({_WHISPER_MODEL_NAME})…", 0.68)
         try:
-            device = get_torch_device()
+            device = get_whisper_device()
             _WHISPER_MODEL = whisper.load_model(_WHISPER_MODEL_NAME, device=str(device))
         except Exception as exc:
             from app.utils import format_user_error

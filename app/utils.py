@@ -118,6 +118,15 @@ def get_torch_device():
     return torch.device("cpu")
 
 
+def get_whisper_device():
+    """Device for OpenAI Whisper — MPS lacks float64, so fall back to CPU on Apple Silicon."""
+    import torch
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 def torch_acceleration_label() -> str:
     """Human-readable label for the active PyTorch backend."""
     import torch
