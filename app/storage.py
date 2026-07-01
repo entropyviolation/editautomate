@@ -352,6 +352,18 @@ class Library:
     def _write_index(self, path: Path, items: list[dict]) -> None:
         path.write_text(json.dumps(items, indent=2))
 
+    def _is_under_dir(self, path: Path, directory: Path) -> bool:
+        try:
+            return path.resolve().is_relative_to(directory.resolve())
+        except (ValueError, OSError):
+            return False
+
+    def _unlink_if_managed(self, path: Path) -> None:
+        if not path.is_file():
+            return
+        if self._is_under_dir(path, self.media_dir) or self._is_under_dir(path, self.root):
+            path.unlink(missing_ok=True)
+
     # --- Songs ---
 
     def list_songs(self) -> list[SongRecord]:
@@ -401,6 +413,9 @@ class Library:
         self._write_index(self.songs_dir / "index.json", items)
 
     def delete_song(self, song_id: str) -> None:
+        record = self.get_song(song_id)
+        if record:
+            self._unlink_if_managed(Path(record.path))
         items = [d for d in self._read_index(self.songs_dir / "index.json") if d.get("id") != song_id]
         self._write_index(self.songs_dir / "index.json", items)
 
@@ -437,6 +452,9 @@ class Library:
         return record
 
     def delete_source(self, source_id: str) -> None:
+        record = self.get_source(source_id)
+        if record:
+            self._unlink_if_managed(Path(record.path))
         items = [d for d in self._read_index(self.sources_dir / "index.json") if d.get("id") != source_id]
         self._write_index(self.sources_dir / "index.json", items)
 
@@ -487,6 +505,9 @@ class Library:
         self._write_index(self.edits_dir / "index.json", items)
 
     def delete_edit(self, edit_id: str) -> None:
+        record = self.get_edit(edit_id)
+        if record:
+            self._unlink_if_managed(Path(record.with_audio_path))
         items = [d for d in self._read_index(self.edits_dir / "index.json") if d.get("id") != edit_id]
         self._write_index(self.edits_dir / "index.json", items)
 

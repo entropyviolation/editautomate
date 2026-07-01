@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -13,6 +15,8 @@ from app.utils import ProgressCallback, default_progress, get_video_info, get_wh
 
 _WHISPER_MODEL = None
 _WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "small")
+# Whisper uses KV-cache hooks that race when transcribe() runs on multiple threads.
+_WHISPER_LOCK = threading.Lock()
 
 _HALLUCINATION_RE = re.compile(
     r"(thank(s| you) for watching|please subscribe|subtitles by|"
@@ -84,7 +88,8 @@ def detect_speech_regions(
     """
     progress("Scanning original audio for dialog/speech…", 0.14)
     model = _get_whisper(progress)
-    result = model.transcribe(
+    result = _whisper_transcribe(
+        model,
         str(audio_path),
         word_timestamps=True,
         language="en",
@@ -105,7 +110,9 @@ def detect_speech_regions(
         return False
 
     regions: list[SpeechRegion] = []
-    for segment in result.get("segments", []):
+    for segment in result.get("segments") or []:
+        if not segment:
+            continue
         if segment.get("no_speech_prob", 1.0) > 0.62:
             continue
         if segment.get("avg_logprob", 0.0) < -1.05:
@@ -113,8 +120,11 @@ def detect_speech_regions(
         text = (segment.get("text") or "").strip()
         if not text or _HALLUCINATION_RE.search(text):
             continue
-        start = float(segment["start"])
-        end = float(segment["end"])
+        start_raw, end_raw = segment.get("start"), segment.get("end")
+        if start_raw is None or end_raw is None:
+            continue
+        start = float(start_raw)
+        end = float(end_raw)
         if end - start < 0.12:
             continue
         sung = _looks_like_sung_lyrics(text)
@@ -375,25 +385,32 @@ def video_has_audio(path: Path) -> bool:
 def _get_whisper(progress: ProgressCallback | None = None):
     """Load OpenAI Whisper model locally (free — no API key)."""
     global _WHISPER_MODEL
-    if _WHISPER_MODEL is not None:
-        try:
-            if next(_WHISPER_MODEL.parameters()).device.type == "mps":
-                _WHISPER_MODEL = None
-        except StopIteration:
-            pass
-    if _WHISPER_MODEL is None:
-        import whisper
+    with _WHISPER_LOCK:
+        if _WHISPER_MODEL is not None:
+            try:
+                if next(_WHISPER_MODEL.parameters()).device.type == "mps":
+                    _WHISPER_MODEL = None
+            except StopIteration:
+                pass
+        if _WHISPER_MODEL is None:
+            import whisper
 
-        if progress:
-            progress(f"Loading Whisper model ({_WHISPER_MODEL_NAME})…", 0.68)
-        try:
-            device = get_whisper_device()
-            _WHISPER_MODEL = whisper.load_model(_WHISPER_MODEL_NAME, device=str(device))
-        except Exception as exc:
-            from app.utils import format_user_error
+            if progress:
+                progress(f"Loading Whisper model ({_WHISPER_MODEL_NAME})…", 0.68)
+            try:
+                device = get_whisper_device()
+                _WHISPER_MODEL = whisper.load_model(_WHISPER_MODEL_NAME, device=str(device))
+            except Exception as exc:
+                from app.utils import format_user_error
 
-            raise RuntimeError(format_user_error(exc)) from exc
-    return _WHISPER_MODEL
+                raise RuntimeError(format_user_error(exc)) from exc
+        return _WHISPER_MODEL
+
+
+def _whisper_transcribe(model: Any, audio: str, **kwargs: Any) -> dict:
+    """Thread-safe wrapper — Whisper is not safe for concurrent transcribe() calls."""
+    with _WHISPER_LOCK:
+        return model.transcribe(audio, **kwargs)
 
 
 def _segment_is_reliable(segment: dict) -> bool:
@@ -529,7 +546,8 @@ def transcribe_lyrics(
 ) -> list[LyricLine]:
     progress("Transcribing new song lyrics…", 0.70)
     model = _get_whisper(progress)
-    result = model.transcribe(
+    result = _whisper_transcribe(
+        model,
         str(audio_path),
         word_timestamps=True,
         language="en",
@@ -541,29 +559,40 @@ def transcribe_lyrics(
         temperature=(0.0, 0.2, 0.4, 0.6),
     )
 
+    if not result:
+        raise RuntimeError("Whisper returned no transcription result")
+
     words: list[tuple[str, float, float]] = []
-    for segment in result.get("segments", []):
-        if not _segment_is_reliable(segment):
+    for segment in result.get("segments") or []:
+        if not segment or not _segment_is_reliable(segment):
             continue
         for word_info in segment.get("words") or []:
+            if not word_info:
+                continue
             text = (word_info.get("word") or "").strip()
             if not text:
                 continue
-            words.append((text, float(word_info["start"]), float(word_info["end"])))
+            word_start, word_end = word_info.get("start"), word_info.get("end")
+            if word_start is None or word_end is None:
+                continue
+            words.append((text, float(word_start), float(word_end)))
 
     lines = dedupe_overlapping_lyrics(_merge_fragment_lines(_group_words_into_lines(words)))
     if not lines:
-        for segment in result.get("segments", []):
-            if not _segment_is_reliable(segment):
+        for segment in result.get("segments") or []:
+            if not segment or not _segment_is_reliable(segment):
                 continue
             text = (segment.get("text") or "").strip()
             if not text:
                 continue
+            seg_start, seg_end = segment.get("start"), segment.get("end")
+            if seg_start is None or seg_end is None:
+                continue
             lines.append(
                 LyricLine(
                     text=text,
-                    start=float(segment["start"]),
-                    end=float(segment["end"]),
+                    start=float(seg_start),
+                    end=float(seg_end),
                 )
             )
         lines = dedupe_overlapping_lyrics(_merge_fragment_lines(lines))

@@ -322,26 +322,40 @@ def run_pipeline(config: PipelineConfig, progress: ProgressCallback = default_pr
         )
         steps.append("audio_replace")
 
-    # 6. Transcribe new song + overlay lyrics in matched font
-    audio_tmp = config.work_dir / "replacement.mp3"
-    if config.snippet_start > 0 or config.snippet_end is not None:
-        extract_audio_snippet(
-            config.replacement_audio,
-            audio_tmp,
-            config.snippet_start,
-            config.snippet_end,
-        )
-    else:
-        extract_audio_from_file(config.replacement_audio, audio_tmp)
-
+    # 6. Overlay lyrics — reuse saved/edited lines when available; transcribe only as fallback
+    lyrics: list[LyricLine]
     if config.lyrics_override:
         lyrics = clip_lyrics_to_snippet(
             config.lyrics_override,
             config.snippet_start,
             config.snippet_end,
         )
-        progress(f"Using {len(lyrics)} edited lyric line(s)", 0.75)
+        if lyrics:
+            progress(f"Using {len(lyrics)} saved lyric line(s)", 0.75)
+        else:
+            progress("Saved lyrics don't cover this snippet — transcribing…", 0.70)
+            audio_tmp = config.work_dir / "replacement.mp3"
+            if config.snippet_start > 0 or config.snippet_end is not None:
+                extract_audio_snippet(
+                    config.replacement_audio,
+                    audio_tmp,
+                    config.snippet_start,
+                    config.snippet_end,
+                )
+            else:
+                extract_audio_from_file(config.replacement_audio, audio_tmp)
+            lyrics = transcribe_lyrics(audio_tmp, progress)
     else:
+        audio_tmp = config.work_dir / "replacement.mp3"
+        if config.snippet_start > 0 or config.snippet_end is not None:
+            extract_audio_snippet(
+                config.replacement_audio,
+                audio_tmp,
+                config.snippet_start,
+                config.snippet_end,
+            )
+        else:
+            extract_audio_from_file(config.replacement_audio, audio_tmp)
         lyrics = transcribe_lyrics(audio_tmp, progress)
 
     overlay_lyrics(

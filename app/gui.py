@@ -506,6 +506,7 @@ class EditAutomateApp(ctk.CTk):
         )
         self.queue_stats_label.pack(side="left", padx=(10, 0))
         self._outline_btn(queue_hdr, "Clear done", self._clear_finished_jobs, width=90).pack(side="right")
+        self._outline_btn(queue_hdr, "Clear failed", self._clear_failed_jobs, width=90).pack(side="right", padx=(0, 6))
 
         self.queue_frame = self._list_panel(
             tab, fg_color=SURFACE_RAISED, corner_radius=10, border_width=1,
@@ -605,7 +606,8 @@ class EditAutomateApp(ctk.CTk):
 
         btn_row = ctk.CTkFrame(right, fg_color="transparent")
         btn_row.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 16))
-        self._outline_btn(btn_row, "Transcribe Snippet", self._transcribe_selected_song).pack(side="left", padx=(0, 8))
+        self._outline_btn(btn_row, "Delete Song", self._delete_selected_song, width=100).pack(side="left")
+        self._outline_btn(btn_row, "Transcribe Snippet", self._transcribe_selected_song).pack(side="left", padx=(8, 0))
         for secs, label in ((15, "15s"), (30, "30s"), (60, "60s")):
             self._outline_btn(
                 btn_row, label, lambda s=secs: self._apply_snippet_preset(s), width=52,
@@ -626,6 +628,7 @@ class EditAutomateApp(ctk.CTk):
             text_color=TEXT_MUTED,
         ).pack(side="left")
         self._outline_btn(hdr, "Clear Finished", self._clear_finished_source_jobs, width=100).pack(side="right", padx=(8, 0))
+        self._outline_btn(hdr, "Clear Failed", self._clear_failed_source_jobs, width=90).pack(side="right", padx=(8, 0))
         self._outline_btn(hdr, "Refresh", self._refresh_sources_list, width=80).pack(side="right")
 
         add_form = ctk.CTkFrame(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1, border_color=BORDER)
@@ -726,7 +729,8 @@ class EditAutomateApp(ctk.CTk):
         preview_actions = ctk.CTkFrame(preview_col, fg_color="transparent")
         preview_actions.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
         self._outline_btn(preview_actions, "Use in Create", self._use_preview_source_in_create, width=120).pack(side="left", padx=(0, 8))
-        self._outline_btn(preview_actions, "Reveal in Finder", self._reveal_preview_source, width=130).pack(side="left")
+        self._outline_btn(preview_actions, "Reveal in Finder", self._reveal_preview_source, width=130).pack(side="left", padx=(0, 8))
+        self._outline_btn(preview_actions, "Delete Source", self._delete_preview_source, width=110).pack(side="right")
 
     def _build_studio_tab(self) -> None:
         tab = self._scrollable_tab("Tweaker")
@@ -744,6 +748,7 @@ class EditAutomateApp(ctk.CTk):
         self.studio_title.grid(row=0, column=1, sticky="ew", padx=(12, 0))
         actions = ctk.CTkFrame(top, fg_color="transparent")
         actions.grid(row=0, column=2, sticky="e")
+        self._outline_btn(actions, "Delete", self._delete_selected_edit, width=72).pack(side="right", padx=(8, 0))
         self._outline_btn(actions, "Open Video", self._open_studio_output, width=100).pack(side="right", padx=(8, 0))
         self._accent_btn(actions, "Export", self._rerender_edit, height=36, width=100).pack(side="right")
 
@@ -754,13 +759,18 @@ class EditAutomateApp(ctk.CTk):
         body.grid_rowconfigure(1, weight=1)
 
         picker = ctk.CTkFrame(body, fg_color="transparent")
-        picker.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(12, 8))
-        ctk.CTkLabel(picker, text="PROJECT", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM).pack(side="left")
+        picker.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(12, 4))
+        picker.grid_columnconfigure(1, weight=1)
+        picker.grid_columnconfigure(3, weight=1)
+
+        ctk.CTkLabel(picker, text="PROJECT", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM).grid(
+            row=0, column=0, sticky="w", padx=(0, 10),
+        )
         self.studio_edit_pick = ctk.CTkComboBox(
             picker,
             values=["(No edits yet)"],
             height=36,
-            width=320,
+            width=280,
             corner_radius=8,
             border_color=BORDER,
             fg_color=SURFACE,
@@ -769,7 +779,15 @@ class EditAutomateApp(ctk.CTk):
             command=self._on_studio_edit_pick,
         )
         self.studio_edit_pick.set("(No edits yet)")
-        self.studio_edit_pick.pack(side="left", padx=(10, 0))
+        self.studio_edit_pick.grid(row=0, column=1, sticky="ew", padx=(0, 12))
+
+        ctk.CTkLabel(picker, text="TITLE", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM).grid(
+            row=0, column=2, sticky="w", padx=(0, 10),
+        )
+        self.studio_edit_title = self._styled_entry(picker, placeholder_text="Video title…")
+        self.studio_edit_title.grid(row=0, column=3, sticky="ew")
+        self.studio_edit_title.bind("<FocusOut>", lambda _e: self._studio_title_changed())
+        self.studio_edit_title.bind("<Return>", lambda _e: self._studio_title_changed())
 
         self.studio_preview = StudioPreview(body, on_time_change=self._on_studio_preview_seek)
         self.studio_preview.grid(row=1, column=0, sticky="nsew", padx=(12, 6), pady=(0, 8))
@@ -1453,6 +1471,83 @@ class EditAutomateApp(ctk.CTk):
         self.snippet_picker.set("(New selection)")
         self._log(f"Deleted snippet '{snippet.name}' from {song.title}")
 
+    def _delete_selected_song(self) -> None:
+        if not self._selected_song_id:
+            messagebox.showinfo("No song", "Select a song to delete.")
+            return
+        song = self._library.get_song(self._selected_song_id)
+        if not song:
+            return
+        if not messagebox.askyesno(
+            "Delete song",
+            f"Remove '{song.title}' from your library?\n\nThis deletes the cached audio copy, snippets, and lyrics.",
+        ):
+            return
+        audio_str = self.audio_entry.get().strip()
+        if audio_str and Path(audio_str).resolve() == Path(song.path).resolve():
+            self.audio_entry.delete(0, "end")
+        self._library.delete_song(song.id)
+        self._selected_song_id = None
+        self._selected_snippet_id = None
+        self._selected_song_lyrics = []
+        self.song_detail_title.configure(text="Select a song")
+        self.song_bpm_label.configure(text="")
+        self.lyrics_editor._textbox.delete("1.0", "end")
+        self._refresh_songs_list()
+        self._log(f"Deleted song: {song.title}")
+
+    def _delete_source(self, src: object) -> None:
+        from app.storage import SourceRecord
+
+        assert isinstance(src, SourceRecord)
+        if not messagebox.askyesno(
+            "Delete source",
+            f"Remove '{src.title}' from your library?\n\nThe inpainted source video copy will be deleted.",
+        ):
+            return
+        if self._selected_source_id == src.id:
+            self._selected_source_id = None
+            self.source_pick.set("(Download new TikTok)")
+        if self._preview_source_id == src.id:
+            self._preview_source_id = None
+        self._library.delete_source(src.id)
+        self._refresh_sources_list()
+        self._log(f"Deleted source: {src.title}")
+
+    def _delete_preview_source(self) -> None:
+        if not self._preview_source_id:
+            messagebox.showinfo("No source", "Select a source to delete.")
+            return
+        src = self._library.get_source(self._preview_source_id)
+        if src:
+            self._delete_source(src)
+
+    def _delete_selected_edit(self) -> None:
+        if not self._selected_edit_id:
+            messagebox.showinfo("No project", "Select a project to delete.")
+            return
+        edit = self._library.get_edit(self._selected_edit_id)
+        if not edit:
+            return
+        if not messagebox.askyesno(
+            "Delete project",
+            f"Remove '{edit.title}' from your library?\n\nThis removes the project record and any cached working video. Exported output files are kept on disk.",
+        ):
+            return
+        if self._selected_export_edit_id == edit.id:
+            self._selected_export_edit_id = None
+        self._library.delete_edit(edit.id)
+        self._selected_edit_id = None
+        self._studio_lyrics = []
+        self._studio_font_style = None
+        self.studio_edit_title.delete(0, "end")
+        self.studio_title.configure(text="Select a project to tweak captions")
+        self.studio_preview.unload()
+        self.studio_timeline.load([], 30.0)
+        self._fill_studio_caption_fields(None)
+        self._refresh_edits_list()
+        self._log(f"Deleted project: {edit.title}")
+
     def _use_song_in_create(self) -> None:
         if not self._selected_song_id:
             messagebox.showinfo("No song", "Select a song first.")
@@ -1464,6 +1559,10 @@ class EditAutomateApp(ctk.CTk):
         self.audio_entry.delete(0, "end")
         self.audio_entry.insert(0, song.path)
         snippet_start, snippet_end = self.waveform.get_selection()
+        edited = self._parse_lyrics_editor(snippet_start)
+        if edited:
+            song.lyrics = merge_lyrics_range(song.lyrics, edited, snippet_start, snippet_end)
+            self._selected_song_lyrics = list(song.lyrics)
         song.snippet_start = snippet_start
         song.snippet_end = snippet_end
         self._library.update_song(song)
@@ -1543,6 +1642,7 @@ class EditAutomateApp(ctk.CTk):
             self._outline_btn(btns, "Preview", lambda s=src: self._select_source_preview(s), width=80).pack(pady=2)
             self._outline_btn(btns, "Use in Create", lambda s=src: self._use_source_in_create(s), width=110).pack(pady=2)
             self._outline_btn(btns, "Reveal", lambda s=src: self._reveal_path(Path(s.path)), width=110).pack(pady=2)
+            self._outline_btn(btns, "Delete", lambda s=src: self._delete_source(s), width=80).pack(pady=2)
 
             for widget in (card, title_lbl, url_lbl, meta_lbl):
                 widget.bind("<Button-1>", lambda _e, s=src: self._select_source_preview(s))
@@ -1651,9 +1751,11 @@ class EditAutomateApp(ctk.CTk):
         pct_lbl.grid(row=0, column=2, rowspan=2, padx=(4, 10), pady=6)
         bar = ctk.CTkProgressBar(row, height=4, width=80, progress_color=ACCENT, fg_color=SURFACE_RAISED)
         bar.set(job.fraction)
-        bar.grid(row=0, column=3, rowspan=2, padx=(0, 10), pady=6)
+        bar.grid(row=0, column=3, rowspan=2, padx=(0, 4), pady=6)
+        rm_btn = self._outline_btn(row, "✕", lambda jid=job.id: self._remove_source_job(jid), width=32)
+        rm_btn.grid(row=0, column=4, rowspan=2, padx=(0, 10), pady=6)
 
-        job.widgets = {"row": row, "dot": dot, "title": title_lbl, "step": step_lbl, "pct": pct_lbl, "bar": bar}
+        job.widgets = {"row": row, "dot": dot, "title": title_lbl, "step": step_lbl, "pct": pct_lbl, "bar": bar, "remove": rm_btn}
 
     def _update_source_job_ui(self, job_id: str) -> None:
         job = self._source_jobs.get(job_id)
@@ -1721,12 +1823,33 @@ class EditAutomateApp(ctk.CTk):
     def _clear_finished_source_jobs(self) -> None:
         to_remove = [jid for jid in self._source_job_order if self._source_jobs[jid].status in ("done", "error")]
         for jid in to_remove:
-            job = self._source_jobs.pop(jid)
-            self._source_job_order.remove(jid)
-            if job.widgets.get("row"):
-                job.widgets["row"].destroy()
+            self._remove_source_job(jid, confirm=False)
         if not self._source_job_order and self._source_jobs_empty_label.winfo_exists():
             self._source_jobs_empty_label.pack(pady=12, padx=12)
+        self._update_source_jobs_stats()
+
+    def _clear_failed_source_jobs(self) -> None:
+        to_remove = [jid for jid in self._source_job_order if self._source_jobs[jid].status == "error"]
+        for jid in to_remove:
+            self._remove_source_job(jid, confirm=False)
+        if not self._source_job_order and self._source_jobs_empty_label.winfo_exists():
+            self._source_jobs_empty_label.pack(pady=12, padx=12)
+        self._update_source_jobs_stats()
+
+    def _remove_source_job(self, job_id: str, *, confirm: bool = True) -> None:
+        job = self._source_jobs.get(job_id)
+        if not job:
+            return
+        if job.status == "running":
+            messagebox.showinfo("Job running", "Wait for the import to finish or fail before removing it.")
+            return
+        if confirm and job.status == "error" and not messagebox.askyesno("Remove failed import", "Remove this failed import from the list?"):
+            return
+        if job.widgets.get("row"):
+            job.widgets["row"].destroy()
+        self._source_jobs.pop(job_id, None)
+        if job_id in self._source_job_order:
+            self._source_job_order.remove(job_id)
         self._update_source_jobs_stats()
 
     def _on_source_pick(self, choice: str) -> None:
@@ -2229,9 +2352,11 @@ class EditAutomateApp(ctk.CTk):
         )
         self._studio_duration = self._studio_edit_duration(edit)
         self._studio_font_style = edit.font_style
-        self.studio_title.configure(text=f"{edit.title} · {len(self._studio_lyrics)} captions")
+        self.studio_title.configure(text=f"{len(self._studio_lyrics)} captions · {self._studio_duration:.1f}s")
 
         self._studio_syncing = True
+        self.studio_edit_title.delete(0, "end")
+        self.studio_edit_title.insert(0, edit.title)
         self.studio_timeline.load(self._studio_lyrics, self._studio_duration)
 
         t = edit.tweak
@@ -2261,6 +2386,20 @@ class EditAutomateApp(ctk.CTk):
         idx = self.studio_timeline.selected_index()
         self._fill_studio_caption_fields(idx)
         self._studio_refresh_preview()
+
+    def _studio_title_changed(self) -> None:
+        if self._studio_syncing or not self._selected_edit_id:
+            return
+        title = self.studio_edit_title.get().strip()
+        if not title:
+            return
+        edit = self._library.get_edit(self._selected_edit_id)
+        if not edit or edit.title == title:
+            return
+        edit.title = title
+        self._library.update_edit(edit)
+        self._refresh_edits_list()
+        self._log(f"Renamed project to '{title}'")
 
     def _studio_style_changed(self, *_args: object) -> None:
         self._studio_refresh_preview()
@@ -2418,9 +2557,11 @@ class EditAutomateApp(ctk.CTk):
         edit = self._library.get_edit(self._selected_edit_id)
         if not edit:
             return
+        self._studio_title_changed()
         tweak = self._current_tweak()
         edit.tweak = tweak
         edit.lyrics = [LyricLine(text=l.text, start=l.start, end=l.end) for l in self._studio_lyrics]
+        edit.title = self.studio_edit_title.get().strip() or edit.title
         self._library.update_edit(edit)
         self._run_bg("Exporting edit…", lambda: self._do_rerender(edit, tweak))
 
@@ -2490,6 +2631,45 @@ class EditAutomateApp(ctk.CTk):
             self.output_entry.delete(0, "end")
             self.output_entry.insert(0, path)
 
+    def _resolve_song_for_create(
+        self, audio: Path
+    ) -> tuple[float, float | None, list[LyricLine] | None, str | None]:
+        """Match library song + snippet, preferring saved/edited lyrics over re-transcription."""
+        from app.storage import SongRecord
+
+        snippet_start = 0.0
+        snippet_end: float | None = None
+        lyrics_override: list[LyricLine] | None = None
+        song_id: str | None = None
+
+        matched: SongRecord | None = None
+        audio_resolved = audio.resolve()
+        for song in self._library.list_songs():
+            if Path(song.path).resolve() == audio_resolved:
+                matched = song
+                song_id = song.id
+                break
+
+        if matched is None:
+            return snippet_start, snippet_end, lyrics_override, song_id
+
+        if self._selected_song_id == matched.id:
+            snippet_start, snippet_end = self.waveform.get_selection()
+            edited = self._parse_lyrics_editor(snippet_start)
+            if edited:
+                lyrics_override = merge_lyrics_range(list(matched.lyrics), edited, snippet_start, snippet_end)
+            elif matched.lyrics:
+                lyrics_override = list(matched.lyrics)
+            elif self._selected_song_lyrics:
+                lyrics_override = list(self._selected_song_lyrics)
+        else:
+            snippet_start = matched.snippet_start
+            snippet_end = matched.snippet_end
+            if matched.lyrics:
+                lyrics_override = list(matched.lyrics)
+
+        return snippet_start, snippet_end, lyrics_override, song_id
+
     def _validate(self, job_work_dir: Path | None = None) -> PipelineConfig | None:
         url = self.url_entry.get().strip()
         audio_str = self.audio_entry.get().strip()
@@ -2508,22 +2688,7 @@ class EditAutomateApp(ctk.CTk):
             return None
         ensure_dir(output.parent)
 
-        snippet_start = 0.0
-        snippet_end: float | None = None
-        lyrics_override = None
-        song_id = None
-
-        for song in self._library.list_songs():
-            if Path(song.path).resolve() == audio.resolve():
-                song_id = song.id
-                if self._selected_song_id == song.id:
-                    snippet_start, snippet_end = self.waveform.get_selection()
-                else:
-                    snippet_start = song.snippet_start
-                    snippet_end = song.snippet_end
-                if song.lyrics:
-                    lyrics_override = song.lyrics
-                break
+        snippet_start, snippet_end, lyrics_override, song_id = self._resolve_song_for_create(audio)
 
         source_video = None
         if use_source:
@@ -2611,17 +2776,22 @@ class EditAutomateApp(ctk.CTk):
         self._create_job(start=False)
 
     def _run_queue(self) -> None:
-        started = 0
+        if self._try_start_next_job():
+            self._log("Started next queued job")
+        else:
+            self._log("No queued jobs to run")
+        self._update_queue_stats()
+
+    def _try_start_next_job(self) -> bool:
+        """Start the next queued edit only when no other edit is running."""
+        if any(j.status == "running" for j in self._jobs.values()):
+            return False
         for jid in self._job_order:
             job = self._jobs.get(jid)
             if job and job.status == "queued":
                 self._submit_job(job)
-                started += 1
-        if started:
-            self._log(f"Started {started} queued job(s)")
-        else:
-            self._log("No queued jobs to run")
-        self._update_queue_stats()
+                return True
+        return False
 
     def _render_job_row(self, job: QueuedEdit) -> None:
         if self._queue_empty_label.winfo_exists():
@@ -2651,9 +2821,11 @@ class EditAutomateApp(ctk.CTk):
         pct_lbl.grid(row=1, column=2, padx=(4, 4), pady=(0, 6))
         bar = ctk.CTkProgressBar(row, height=4, width=100, progress_color=ACCENT, fg_color=SURFACE_RAISED)
         bar.set(job.fraction)
-        bar.grid(row=0, column=3, rowspan=2, padx=(0, 10), pady=6)
+        bar.grid(row=0, column=3, rowspan=2, padx=(0, 4), pady=6)
+        rm_btn = self._outline_btn(row, "✕", lambda jid=job.id: self._remove_job(jid), width=32)
+        rm_btn.grid(row=0, column=4, rowspan=2, padx=(0, 10), pady=6)
 
-        job.widgets = {"row": row, "dot": dot, "title": title_lbl, "step": step_lbl, "pct": pct_lbl, "bar": bar, "badge": badge}
+        job.widgets = {"row": row, "dot": dot, "title": title_lbl, "step": step_lbl, "pct": pct_lbl, "bar": bar, "badge": badge, "remove": rm_btn}
 
     def _update_job_ui(self, job_id: str) -> None:
         job = self._jobs.get(job_id)
@@ -2722,6 +2894,7 @@ class EditAutomateApp(ctk.CTk):
         self._refresh_sources_list()
         self._refresh_edits_list()
         self._update_queue_stats()
+        self._try_start_next_job()
 
     def _job_error(self, job_id: str, exc: Exception) -> None:
         job = self._jobs[job_id]
@@ -2734,17 +2907,41 @@ class EditAutomateApp(ctk.CTk):
         self._log(f"ERROR [{job.title}]: {job.error}")
         messagebox.showerror("Processing failed", f"{job.title}\n\n{job.error}")
         self._update_queue_stats()
+        self._try_start_next_job()
 
     def _clear_finished_jobs(self) -> None:
         to_remove = [jid for jid in self._job_order if self._jobs[jid].status in ("done", "error")]
         for jid in to_remove:
-            job = self._jobs.pop(jid)
-            self._job_order.remove(jid)
-            if job.widgets.get("row"):
-                job.widgets["row"].destroy()
+            self._remove_job(jid, confirm=False)
         if not self._job_order and self._queue_empty_label.winfo_exists():
             self._queue_empty_label.pack(pady=20, padx=12)
         self._update_queue_stats()
+
+    def _clear_failed_jobs(self) -> None:
+        to_remove = [jid for jid in self._job_order if self._jobs[jid].status == "error"]
+        for jid in to_remove:
+            self._remove_job(jid, confirm=False)
+        if not self._job_order and self._queue_empty_label.winfo_exists():
+            self._queue_empty_label.pack(pady=20, padx=12)
+        self._update_queue_stats()
+
+    def _remove_job(self, job_id: str, *, confirm: bool = True) -> None:
+        job = self._jobs.get(job_id)
+        if not job:
+            return
+        if job.status == "running":
+            messagebox.showinfo("Job running", "Wait for the edit to finish or fail before removing it.")
+            return
+        if confirm and job.status == "error" and not messagebox.askyesno("Remove failed edit", "Remove this failed job from the queue?"):
+            return
+        if job.widgets.get("row"):
+            job.widgets["row"].destroy()
+        self._jobs.pop(job_id, None)
+        if job_id in self._job_order:
+            self._job_order.remove(job_id)
+        self._update_queue_stats()
+        if not self._job_order and self._queue_empty_label.winfo_exists():
+            self._queue_empty_label.pack(pady=20, padx=12)
 
     def _run_bg(self, status: str, fn: object) -> None:
         self._bg_busy = True
