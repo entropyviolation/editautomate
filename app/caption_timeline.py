@@ -221,6 +221,7 @@ class CaptionTimeline(ctk.CTkFrame):
                 start, end = 0.0, dur
             if end > self._duration:
                 end, start = self._duration, self._duration - dur
+            start, end = self._clamp_block(idx, start, end)
             line.start, line.end = start, end
         elif self._drag_mode == "resize_start":
             start, end = self._clamp_block(idx, t, line.end)

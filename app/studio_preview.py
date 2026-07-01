@@ -87,9 +87,9 @@ class StudioPreview(ctk.CTkFrame):
         self.play_btn.pack(side="right")
 
         self._frame_host = ctk.CTkFrame(self, fg_color=_BG, corner_radius=8, border_width=1, border_color=_BORDER)
-        self._frame_host.pack(fill="x", padx=12, pady=(0, 8))
+        self._frame_host.pack(fill="both", expand=True, padx=12, pady=(0, 8))
         self._frame_host.pack_propagate(False)
-        self._frame_host.configure(height=340)
+        self._frame_host.configure(height=420)
 
         self.canvas = tk.Canvas(
             self._frame_host,
@@ -127,10 +127,10 @@ class StudioPreview(ctk.CTkFrame):
             wraplength=520,
             justify="left",
         )
-        self.caption_label.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=(10, 4))
+        self.caption_label.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=(8, 4))
 
         ctk.CTkLabel(info, text="Style", font=ctk.CTkFont(size=11), text_color=_TEXT_DIM).grid(
-            row=1, column=0, sticky="w", padx=(12, 8), pady=(0, 10),
+            row=1, column=0, sticky="w", padx=(12, 8), pady=(0, 8),
         )
         self.style_label = ctk.CTkLabel(
             info,
@@ -139,7 +139,7 @@ class StudioPreview(ctk.CTkFrame):
             text_color=_TEXT_MUTED,
             anchor="w",
         )
-        self.style_label.grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=(0, 10))
+        self.style_label.grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=(0, 8))
 
     def load(
         self,

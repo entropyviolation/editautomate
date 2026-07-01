@@ -97,8 +97,8 @@ def analyze_audio_beats(
 def detect_scene_cuts(
     video_path: Path,
     progress: ProgressCallback = default_progress,
-    threshold: float = 0.38,
-    min_gap_sec: float = 0.25,
+    threshold: float = 0.44,
+    min_gap_sec: float = 0.45,
 ) -> list[float]:
     """Return scene-change timestamps in seconds (always includes 0 and duration)."""
     progress("Detecting video scene cuts…", 0.68)
@@ -301,8 +301,140 @@ def _beats_in_range(beats: list[float], start: float, end: float) -> list[float]
 
 def _segment_speed_filter(speed: float) -> str:
     """Build ffmpeg setpts filter; speed > 1 = faster playback."""
-    speed = max(0.25, min(4.0, speed))
+    speed = max(0.2, min(3.0, speed))
     return f"setpts=PTS/{speed:.6f}"
+
+
+def _segment_motion_scores(
+    video_path: Path,
+    cuts: list[float],
+    progress: ProgressCallback = default_progress,
+) -> list[float]:
+    """Return a 0..1 motion score for each segment between scene cuts."""
+    _, _, fps, _ = get_video_info(video_path)
+    if len(cuts) < 2:
+        return []
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return [0.5] * (len(cuts) - 1)
+
+    scores: list[float] = []
+    try:
+        for i in range(len(cuts) - 1):
+            v_start, v_end = cuts[i], cuts[i + 1]
+            seg_dur = max(0.04, v_end - v_start)
+            sample_count = max(3, min(12, int(seg_dur * 4)))
+            prev_gray: np.ndarray | None = None
+            diffs: list[float] = []
+
+            for s in range(sample_count):
+                t = v_start + (s / max(1, sample_count - 1)) * seg_dur
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(t * fps)))
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                gray = cv2.cvtColor(cv2.resize(frame, (64, 64)), cv2.COLOR_BGR2GRAY)
+                if prev_gray is not None:
+                    diffs.append(float(np.mean(cv2.absdiff(prev_gray, gray)) / 255.0))
+                prev_gray = gray
+
+            if diffs:
+                scores.append(float(np.clip(np.mean(diffs) * 4.5, 0.0, 1.0)))
+            else:
+                scores.append(0.0)
+    finally:
+        cap.release()
+
+    progress(
+        f"Motion scores: {sum(1 for s in scores if s < 0.25)} calm, "
+        f"{sum(1 for s in scores if s >= 0.55)} dynamic segment(s)",
+        0.74,
+    )
+    return scores
+
+
+def _merge_adjacent_cuts(
+    cuts: list[float],
+    motion_scores: list[float],
+    *,
+    max_segments: int,
+) -> tuple[list[float], list[float]]:
+    """Merge the calmest neighboring segments until segment count fits the beat budget."""
+    if len(cuts) - 1 <= max_segments:
+        return cuts, motion_scores
+
+    merged_cuts = list(cuts)
+    merged_scores = list(motion_scores)
+    while len(merged_cuts) - 1 > max_segments and len(merged_scores) >= 2:
+        merge_idx = min(
+            range(len(merged_scores) - 1),
+            key=lambda i: merged_scores[i] + merged_scores[i + 1],
+        )
+        combined = (
+            merged_scores[merge_idx] * 0.45 + merged_scores[merge_idx + 1] * 0.55
+        )
+        merged_scores[merge_idx : merge_idx + 2] = [combined]
+        merged_cuts.pop(merge_idx + 1)
+
+    return merged_cuts, merged_scores
+
+
+def _allocate_beat_counts(
+    motion_scores: list[float],
+    v_durations: list[float],
+    n_beats: int,
+) -> list[int]:
+    """Give calm/static segments more beats; keep dynamic segments snappy."""
+    n_seg = len(motion_scores)
+    if n_seg == 0:
+        return []
+    if n_beats <= 0:
+        return [0] * n_seg
+    if n_seg == 1:
+        return [n_beats]
+
+    weights: list[float] = []
+    for motion, v_dur in zip(motion_scores, v_durations):
+        calm = 1.0 - motion
+        # Long, static shots linger across many beats; busy shots stay on one beat.
+        weights.append(max(0.08, v_dur * (0.25 + calm * 3.0 + motion * 0.35)))
+
+    total_w = sum(weights)
+    raw = [n_beats * w / total_w for w in weights]
+    counts = [max(1, int(math.floor(r))) for r in raw]
+
+    remainder = n_beats - sum(counts)
+    ranked = sorted(
+        (
+            (raw[i] - math.floor(raw[i]), 1.0 - motion_scores[i], i)
+            for i in range(n_seg)
+        ),
+        reverse=True,
+    )
+    for _, _, idx in ranked:
+        if remainder <= 0:
+            break
+        counts[idx] += 1
+        remainder -= 1
+
+    while sum(counts) > n_beats:
+        trim_idx = max(
+            range(n_seg),
+            key=lambda i: (motion_scores[i], counts[i] / max(v_durations[i], 0.04)),
+        )
+        if counts[trim_idx] <= 1:
+            break
+        counts[trim_idx] -= 1
+
+    while sum(counts) < n_beats:
+        add_idx = max(
+            range(n_seg),
+            key=lambda i: ((1.0 - motion_scores[i]) * v_durations[i], counts[i]),
+        )
+        counts[add_idx] += 1
+
+    return counts
 
 
 def sync_video_to_song(
@@ -366,18 +498,33 @@ def sync_video_to_song(
     # Normalize song beats to 0..target_duration timeline
     song_beats_local = [b - start for b in song_beats]
 
-    # Align video cuts to song beats via per-segment speed adjustment
-    n_seg = min(len(cuts) - 1, len(song_beats_local) - 1)
+    n_beats = max(1, len(song_beats_local) - 1)
+    motion_scores = _segment_motion_scores(working, cuts, progress)
+    cuts, motion_scores = _merge_adjacent_cuts(cuts, motion_scores, max_segments=n_beats)
+    n_seg = len(cuts) - 1
     if n_seg < 1:
         run_ffmpeg(["-i", str(working), "-c:v", "copy", "-an", str(output_path)])
         return output_path
 
+    v_durations = [max(0.04, cuts[i + 1] - cuts[i]) for i in range(n_seg)]
+    beat_counts = _allocate_beat_counts(motion_scores, v_durations, n_beats)
+
     progress("Mapping video cuts to song beats…", 0.75)
 
     segment_files: list[Path] = []
+    beat_cursor = 0
     for i in range(n_seg):
+        beat_span = beat_counts[i]
+        if beat_cursor + beat_span > len(song_beats_local) - 1:
+            beat_span = max(1, len(song_beats_local) - 1 - beat_cursor)
+        if beat_span < 1:
+            break
+
         v_start, v_end = cuts[i], cuts[i + 1]
-        s_start, s_end = song_beats_local[i], song_beats_local[i + 1]
+        s_start = song_beats_local[beat_cursor]
+        s_end = song_beats_local[beat_cursor + beat_span]
+        beat_cursor += beat_span
+
         v_dur = max(0.04, v_end - v_start)
         s_dur = max(0.04, s_end - s_start)
         speed = v_dur / s_dur
@@ -406,7 +553,9 @@ def sync_video_to_song(
         )
         segment_files.append(seg_out)
 
-    # If video had extra tail beyond mapped segments, skip it (beat-aligned edit)
+    if not segment_files:
+        run_ffmpeg(["-i", str(working), "-c:v", "copy", "-an", str(output_path)])
+        return output_path
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         list_path = Path(f.name)

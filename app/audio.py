@@ -123,6 +123,27 @@ def strip_audio(video_path: Path, output_path: Path) -> Path:
     return output_path
 
 
+def dedupe_overlapping_lyrics(lines: list[LyricLine]) -> list[LyricLine]:
+    """Remove overlapping timestamps and merge duplicate consecutive text."""
+    if len(lines) < 2:
+        return lines
+
+    ordered = sorted(lines, key=lambda line: (line.start, line.end))
+    merged: list[LyricLine] = [LyricLine(text=ordered[0].text, start=ordered[0].start, end=ordered[0].end)]
+
+    for line in ordered[1:]:
+        prev = merged[-1]
+        if line.start < prev.end - 0.02:
+            same_text = line.text.strip().lower() == prev.text.strip().lower()
+            if same_text or line.text.strip() in prev.text or prev.text.strip() in line.text:
+                prev.end = max(prev.end, line.end)
+                continue
+            prev.end = min(prev.end, line.start)
+        merged.append(LyricLine(text=line.text, start=line.start, end=line.end))
+
+    return merged
+
+
 def _group_words_into_lines(
     words: list[tuple[str, float, float]],
     *,
@@ -184,7 +205,7 @@ def transcribe_lyrics(
                 continue
             words.append((text, float(word_info["start"]), float(word_info["end"])))
 
-    lines = _merge_fragment_lines(_group_words_into_lines(words))
+    lines = dedupe_overlapping_lyrics(_merge_fragment_lines(_group_words_into_lines(words)))
     if not lines:
         for segment in result.get("segments", []):
             if not _segment_is_reliable(segment):
@@ -199,7 +220,7 @@ def transcribe_lyrics(
                     end=float(segment["end"]),
                 )
             )
-        lines = _merge_fragment_lines(lines)
+        lines = dedupe_overlapping_lyrics(_merge_fragment_lines(lines))
 
     if not lines and result.get("text"):
         duration = _audio_duration(audio_path)
@@ -265,6 +286,22 @@ def replace_audio(
     return output_path
 
 
+def filter_lyrics_to_snippet(
+    lyrics: list[LyricLine],
+    start: float,
+    end: float | None,
+) -> list[LyricLine]:
+    """Return lyric lines overlapping a snippet window (absolute timestamps preserved)."""
+    if not lyrics:
+        return []
+    window_end = end if end is not None else float("inf")
+    return [
+        line
+        for line in lyrics
+        if not (line.end <= start or line.start >= window_end)
+    ]
+
+
 def clip_lyrics_to_snippet(
     lyrics: list[LyricLine],
     start: float,
@@ -272,7 +309,7 @@ def clip_lyrics_to_snippet(
 ) -> list[LyricLine]:
     """Filter and re-base lyric timestamps for a song snippet."""
     if start <= 0 and end is None:
-        return lyrics
+        return dedupe_overlapping_lyrics(lyrics)
     clipped: list[LyricLine] = []
     window_end = end if end is not None else float("inf")
     for line in lyrics:
@@ -285,7 +322,7 @@ def clip_lyrics_to_snippet(
                 end=min(window_end - start, line.end - start),
             )
         )
-    return clipped
+    return dedupe_overlapping_lyrics(clipped)
 
 
 def extract_audio_from_file(media_path: Path, output_path: Path) -> Path:

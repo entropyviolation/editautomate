@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from app.audio import LyricLine
+from app.audio import LyricLine, dedupe_overlapping_lyrics
 from app.fonts import (
     FALLBACK_BLEED_BLUR_RADIUS,
     FALLBACK_BLEED_OPACITY,
@@ -300,6 +300,7 @@ def overlay_lyrics(
 ) -> Path:
     progress("Rendering lyrics with matched font…", 0.80)
 
+    lyrics = dedupe_overlapping_lyrics(lyrics)
     width, height, fps, duration = get_video_info(video_path)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():

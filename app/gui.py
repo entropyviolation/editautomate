@@ -17,7 +17,9 @@ import customtkinter as ctk
 from app.audio import (
     LyricLine,
     clip_lyrics_to_snippet,
+    dedupe_overlapping_lyrics,
     extract_audio_from_file,
+    filter_lyrics_to_snippet,
     merge_lyrics_range,
     transcribe_lyrics,
 )
@@ -77,6 +79,21 @@ TEXT_DIM = "#55556a"
 LOG_BG = "#0c0c14"
 SUCCESS = "#3dd68c"
 WARNING = "#f0b429"
+
+
+def _fmt_lyric_time(seconds: float) -> str:
+    s = max(0.0, seconds)
+    if s >= 60:
+        return f"{int(s // 60)}:{int(s % 60):02d}.{int((s % 1) * 10)}"
+    return f"{s:.1f}s"
+
+
+def _parse_lyric_time(raw: str) -> float:
+    raw = raw.strip().rstrip("s").strip()
+    if ":" in raw:
+        mins, secs = raw.split(":", 1)
+        return float(mins) * 60 + float(secs)
+    return float(raw)
 
 
 class EditAutomateApp(ctk.CTk):
@@ -491,7 +508,7 @@ class EditAutomateApp(ctk.CTk):
         self.waveform.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 8))
 
         ctk.CTkLabel(
-            right, text="LYRICS FOR SNIPPET (timestamps relative to selection)", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM,
+            right, text="LYRICS FOR SNIPPET (click timestamp to jump)", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM,
         ).grid(row=6, column=0, sticky="nw", padx=16, pady=(0, 4))
 
         self.lyrics_editor = ctk.CTkTextbox(
@@ -499,6 +516,7 @@ class EditAutomateApp(ctk.CTk):
             text_color=TEXT_MUTED, corner_radius=8, border_width=1, border_color=BORDER,
         )
         self.lyrics_editor.grid(row=7, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self._setup_lyrics_editor_tags()
 
         btn_row = ctk.CTkFrame(right, fg_color="transparent")
         btn_row.grid(row=8, column=0, sticky="ew", padx=16, pady=(0, 16))
@@ -646,10 +664,12 @@ class EditAutomateApp(ctk.CTk):
 
         body = ctk.CTkFrame(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1, border_color=BORDER)
         body.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
-        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(0, weight=3)
+        body.grid_columnconfigure(1, weight=2)
+        body.grid_rowconfigure(1, weight=1)
 
         picker = ctk.CTkFrame(body, fg_color="transparent")
-        picker.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        picker.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(12, 8))
         ctk.CTkLabel(picker, text="PROJECT", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM).pack(side="left")
         self.studio_edit_pick = ctk.CTkComboBox(
             picker,
@@ -667,47 +687,32 @@ class EditAutomateApp(ctk.CTk):
         self.studio_edit_pick.pack(side="left", padx=(10, 0))
 
         self.studio_preview = StudioPreview(body, on_time_change=self._on_studio_preview_seek)
-        self.studio_preview.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+        self.studio_preview.grid(row=1, column=0, sticky="nsew", padx=(12, 6), pady=(0, 8))
 
-        self.studio_timeline = CaptionTimeline(
-            body,
-            on_select=self._on_studio_caption_select,
-            on_change=self._on_studio_timeline_change,
-            on_seek=self._on_studio_timeline_seek,
-        )
-        self.studio_timeline.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+        right_panel = ctk.CTkFrame(body, fg_color="transparent")
+        right_panel.grid(row=1, column=1, sticky="nsew", padx=(6, 12), pady=(0, 8))
+        right_panel.grid_columnconfigure(0, weight=1)
 
-        tl_tools = ctk.CTkFrame(body, fg_color="transparent")
-        tl_tools.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
-        self._outline_btn(tl_tools, "+ Add Caption", self._studio_add_caption, width=110).pack(side="left", padx=(0, 8))
-        self._outline_btn(tl_tools, "Delete", self._studio_delete_caption, width=80).pack(side="left")
-        ctk.CTkLabel(
-            tl_tools,
-            text="Drag blocks to move · drag edges to trim · click timeline or preview to scrub",
-            font=ctk.CTkFont(size=11),
-            text_color=TEXT_DIM,
-        ).pack(side="right")
-
-        editor = ctk.CTkFrame(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1, border_color=BORDER)
-        editor.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
+        editor = ctk.CTkFrame(right_panel, fg_color=SURFACE, corner_radius=10, border_width=1, border_color=BORDER)
+        editor.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         editor.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
             editor, text="SELECTED CAPTION", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM,
-        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(14, 8))
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=14, pady=(12, 6))
 
         ctk.CTkLabel(editor, text="Text", font=ctk.CTkFont(size=12), text_color=TEXT_MUTED).grid(
-            row=1, column=0, sticky="w", padx=16, pady=6,
+            row=1, column=0, sticky="w", padx=14, pady=4,
         )
         self.studio_caption_text = self._styled_entry(editor, placeholder_text="Caption text…")
-        self.studio_caption_text.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 16), pady=6)
+        self.studio_caption_text.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 14), pady=4)
         self.studio_caption_text.bind("<KeyRelease>", lambda _e: self._studio_caption_text_changed())
 
-        timing = ctk.CTkFrame(editor, fg_color=SURFACE, corner_radius=8)
-        timing.grid(row=2, column=0, columnspan=3, sticky="ew", padx=16, pady=(4, 12))
+        timing = ctk.CTkFrame(editor, fg_color=SURFACE_RAISED, corner_radius=8)
+        timing.grid(row=2, column=0, columnspan=3, sticky="ew", padx=14, pady=(4, 12))
         for col, (label, attr) in enumerate((("Start", "studio_start"), ("End", "studio_end"), ("Duration", "studio_dur"))):
             cell = ctk.CTkFrame(timing, fg_color="transparent")
-            cell.grid(row=0, column=col, sticky="ew", padx=(14 if col == 0 else 8, 8), pady=10)
+            cell.grid(row=0, column=col, sticky="ew", padx=(10 if col == 0 else 6, 6), pady=8)
             ctk.CTkLabel(cell, text=label, font=ctk.CTkFont(size=11), text_color=TEXT_DIM).pack(anchor="w")
             entry = self._styled_entry(cell)
             entry.pack(fill="x", pady=(4, 0))
@@ -719,15 +724,15 @@ class EditAutomateApp(ctk.CTk):
         self.studio_start.bind("<KeyRelease>", lambda _e: self._studio_timing_changed())
         self.studio_end.bind("<KeyRelease>", lambda _e: self._studio_timing_changed())
 
-        style_hdr = ctk.CTkFrame(tab, fg_color="transparent")
-        style_hdr.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 4))
-        ctk.CTkLabel(style_hdr, text="TEXT STYLE", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM).pack(side="left")
-
-        style = ctk.CTkFrame(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1, border_color=BORDER)
-        style.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))
+        style = ctk.CTkFrame(right_panel, fg_color=SURFACE, corner_radius=10, border_width=1, border_color=BORDER)
+        style.grid(row=1, column=0, sticky="ew")
         style.grid_columnconfigure(1, weight=1)
 
-        row = 0
+        ctk.CTkLabel(
+            style, text="TEXT STYLE", font=ctk.CTkFont(size=10, weight="bold"), text_color=TEXT_DIM,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=14, pady=(12, 6))
+
+        row = 1
         for label, attr, from_, to_, default in (
             ("Position X", "tweak_x", -200, 200, 0),
             ("Position Y", "tweak_y", -200, 200, 0),
@@ -735,10 +740,10 @@ class EditAutomateApp(ctk.CTk):
             ("Outline", "tweak_stroke", 0, 12, 2),
         ):
             ctk.CTkLabel(style, text=label, font=ctk.CTkFont(size=12), text_color=TEXT_MUTED).grid(
-                row=row, column=0, sticky="w", padx=16, pady=6,
+                row=row, column=0, sticky="w", padx=14, pady=5,
             )
             lbl = ctk.CTkLabel(style, text=str(default), font=ctk.CTkFont(size=11), text_color=TEXT_DIM, width=44)
-            lbl.grid(row=row, column=2, sticky="e", padx=16)
+            lbl.grid(row=row, column=2, sticky="e", padx=14)
             slider = ctk.CTkSlider(
                 style,
                 from_=from_,
@@ -746,20 +751,20 @@ class EditAutomateApp(ctk.CTk):
                 command=lambda v, l=lbl: (l.configure(text=f"{int(float(v))}"), self._studio_style_changed()),
             )
             slider.set(default)
-            slider.grid(row=row, column=1, sticky="ew", padx=8, pady=6)
+            slider.grid(row=row, column=1, sticky="ew", padx=8, pady=5)
             setattr(self, attr, slider)
             setattr(self, f"{attr}_label", lbl)
             row += 1
 
         ctk.CTkLabel(style, text="Font", font=ctk.CTkFont(size=12), text_color=TEXT_MUTED).grid(
-            row=row, column=0, sticky="w", padx=16, pady=6,
+            row=row, column=0, sticky="w", padx=14, pady=5,
         )
         self.tweak_font = ctk.CTkComboBox(
             style, values=TIKTOK_FONT_CANDIDATES, height=36, corner_radius=8,
             border_color=BORDER, fg_color=SURFACE, button_color=BORDER,
         )
         self.tweak_font.set("Arial Narrow")
-        self.tweak_font.grid(row=row, column=1, columnspan=2, sticky="ew", padx=16, pady=6)
+        self.tweak_font.grid(row=row, column=1, columnspan=2, sticky="ew", padx=14, pady=5)
         self.tweak_font.configure(command=lambda _v: self._studio_style_changed())
         row += 1
 
@@ -769,10 +774,29 @@ class EditAutomateApp(ctk.CTk):
             font=ctk.CTkFont(size=12), text_color=TEXT_MUTED,
             fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER, checkmark_color=BG,
             command=self._studio_style_changed,
-        ).grid(row=row, column=0, columnspan=3, sticky="w", padx=16, pady=(4, 14))
+        ).grid(row=row, column=0, columnspan=3, sticky="w", padx=14, pady=(4, 12))
+
+        self.studio_timeline = CaptionTimeline(
+            body,
+            on_select=self._on_studio_caption_select,
+            on_change=self._on_studio_timeline_change,
+            on_seek=self._on_studio_timeline_seek,
+        )
+        self.studio_timeline.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
+
+        tl_tools = ctk.CTkFrame(body, fg_color="transparent")
+        tl_tools.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+        self._outline_btn(tl_tools, "+ Add Caption", self._studio_add_caption, width=110).pack(side="left", padx=(0, 8))
+        self._outline_btn(tl_tools, "Delete", self._studio_delete_caption, width=80).pack(side="left")
+        ctk.CTkLabel(
+            tl_tools,
+            text="Preview shows captions on video · drag timeline blocks to move or trim",
+            font=ctk.CTkFont(size=11),
+            text_color=TEXT_DIM,
+        ).pack(side="right")
 
         self.edits_list = self._list_panel(tab, fg_color=SURFACE_RAISED, corner_radius=12, border_width=1)
-        self.edits_list.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.edits_list.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
         self.edits_list.grid_remove()
 
     def _build_progress_footer(self) -> None:
@@ -940,6 +964,7 @@ class EditAutomateApp(ctk.CTk):
             snippet_start = song.snippet_start
             snippet_end = song.snippet_end
         self._refresh_snippet_picker(song)
+        self.waveform.set_playhead(None)
         if Path(song.path).exists():
             self.waveform.load_audio(Path(song.path), snippet_start, snippet_end)
         else:
@@ -949,22 +974,67 @@ class EditAutomateApp(ctk.CTk):
     def _on_waveform_change(self, start: float, end: float) -> None:
         self._selected_snippet_id = None
         self.snippet_picker.set("(New selection)")
+        self.waveform.set_playhead(None)
         self._refresh_snippet_lyrics()
+
+    def _setup_lyrics_editor_tags(self) -> None:
+        tb = self.lyrics_editor._textbox
+        tb.tag_configure("lyric_ts", foreground=ACCENT, underline=True)
+        tb.tag_bind("lyric_ts", "<Enter>", lambda _e: tb.configure(cursor="hand2"))
+        tb.tag_bind("lyric_ts", "<Leave>", lambda _e: tb.configure(cursor="xterm"))
+        tb.bind("<Button-1>", self._on_lyrics_editor_click, add="+")
+
+    def _on_lyrics_editor_click(self, event: object) -> str | None:
+        tb = self.lyrics_editor._textbox
+        idx = tb.index(f"@{event.x},{event.y}")  # type: ignore[union-attr]
+        for tag in tb.tag_names(idx):
+            if tag.startswith("nav@"):
+                self.waveform.set_playhead(float(tag[4:]))
+                return "break"
+        return None
+
+    def _insert_clickable_lyric_line(self, line: LyricLine) -> None:
+        tb = self.lyrics_editor._textbox
+        start_str = _fmt_lyric_time(line.start)
+        end_str = _fmt_lyric_time(line.end)
+
+        tb.insert("end", "[")
+        ts_start = tb.index("end-1c")
+        tb.insert("end", start_str)
+        ts_start_end = tb.index("end-1c")
+        tb.insert("end", " – ")
+        ts_end = tb.index("end-1c")
+        tb.insert("end", end_str)
+        ts_end_end = tb.index("end-1c")
+        tb.insert("end", f"] {line.text}\n")
+
+        start_tag = f"nav@{line.start:.3f}"
+        end_tag = f"nav@{line.end:.3f}"
+        for tag, i0, i1 in (
+            (start_tag, ts_start, ts_start_end),
+            (end_tag, ts_end, ts_end_end),
+        ):
+            tb.tag_add("lyric_ts", i0, i1)
+            tb.tag_add(tag, i0, i1)
 
     def _refresh_snippet_lyrics(self) -> None:
         start, end = self.waveform.get_selection()
-        self.lyrics_editor.delete("1.0", "end")
+        tb = self.lyrics_editor._textbox
+        tb.delete("1.0", "end")
+        for tag in tb.tag_names():
+            if tag.startswith("nav@"):
+                tb.tag_delete(tag)
         if not self._selected_song_lyrics:
             self.lyrics_editor.insert("end", "(No lyrics — click Transcribe Snippet)\n")
             return
-        clipped = clip_lyrics_to_snippet(self._selected_song_lyrics, start, end)
-        if not clipped:
+        visible = filter_lyrics_to_snippet(self._selected_song_lyrics, start, end)
+        if not visible:
             self.lyrics_editor.insert("end", "(No lyrics in this snippet — transcribe or edit manually)\n")
             return
-        for line in clipped:
-            self.lyrics_editor.insert("end", f"[{line.start:.1f}s – {line.end:.1f}s] {line.text}\n")
+        for line in visible:
+            self._insert_clickable_lyric_line(line)
 
-    def _parse_lyrics_editor(self, snippet_start: float = 0.0) -> list[LyricLine]:
+    def _parse_lyrics_editor(self, fallback_start: float = 0.0) -> list[LyricLine]:
         lines: list[LyricLine] = []
         for raw in self.lyrics_editor.get("1.0", "end").splitlines():
             raw = raw.strip()
@@ -976,13 +1046,13 @@ class EditAutomateApp(ctk.CTk):
                 times = header.strip("[]").replace("–", "-").split("-")
                 if len(times) == 2:
                     try:
-                        start = float(times[0].replace("s", "").strip()) + snippet_start
-                        end = float(times[1].replace("s", "").strip()) + snippet_start
+                        start = _parse_lyric_time(times[0])
+                        end = _parse_lyric_time(times[1])
                         lines.append(LyricLine(text=text, start=start, end=end))
                         continue
                     except ValueError:
                         pass
-            lines.append(LyricLine(text=raw, start=snippet_start, end=snippet_start + 5.0))
+            lines.append(LyricLine(text=raw, start=fallback_start, end=fallback_start + 5.0))
         return lines
 
     def _upload_song(self) -> None:
@@ -1440,7 +1510,9 @@ class EditAutomateApp(ctk.CTk):
 
         assert isinstance(edit, EditRecord)
         self._selected_edit_id = edit.id
-        self._studio_lyrics = [LyricLine(text=l.text, start=l.start, end=l.end) for l in edit.lyrics]
+        self._studio_lyrics = dedupe_overlapping_lyrics(
+            [LyricLine(text=l.text, start=l.start, end=l.end) for l in edit.lyrics]
+        )
         self._studio_duration = self._studio_edit_duration(edit)
         self._studio_font_style = edit.font_style
         self.studio_title.configure(text=f"{edit.title} · {len(self._studio_lyrics)} captions")
@@ -1485,6 +1557,7 @@ class EditAutomateApp(ctk.CTk):
             self._studio_font_style,
             self._current_tweak(),
         )
+        self.studio_preview.refresh(immediate=True)
 
     def _on_studio_timeline_seek(self, t: float) -> None:
         if self._studio_syncing:
@@ -1626,6 +1699,7 @@ class EditAutomateApp(ctk.CTk):
         assert isinstance(edit, EditRecord)
         out = Path(edit.output_path)
         lyrics = [LyricLine(text=l.text, start=l.start, end=l.end) for l in edit.lyrics]
+        lyrics = dedupe_overlapping_lyrics(lyrics)
         re_render_edit(
             Path(edit.with_audio_path),
             lyrics,

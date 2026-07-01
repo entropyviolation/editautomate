@@ -66,6 +66,7 @@ class WaveformSelector(ctk.CTkFrame):
         self._preview_proc: subprocess.Popen | None = None
         self._preview_poll_id: str | None = None
         self._preview_playing = False
+        self._playhead: float | None = None
 
         self.canvas = tk.Canvas(self, height=96, bg=_BG, highlightthickness=0, cursor="hand2")
         self.canvas.pack(fill="x", padx=10, pady=(10, 6))
@@ -160,6 +161,16 @@ class WaveformSelector(ctk.CTkFrame):
         self._redraw()
         if self._on_change:
             self._on_change(self._start, self._end)
+
+    def set_playhead(self, t: float | None) -> None:
+        """Show a playhead marker at an absolute time in the track."""
+        if t is None:
+            self._playhead = None
+        elif self._duration > 0:
+            self._playhead = max(0.0, min(self._duration, t))
+        else:
+            self._playhead = max(0.0, t)
+        self._redraw()
 
     def _update_label(self) -> None:
         dur = self._end - self._start
@@ -281,6 +292,11 @@ class WaveformSelector(ctk.CTkFrame):
         for x in (sx, ex):
             c.create_rectangle(x - hw, 0, x + hw, h, fill=_HANDLE, outline=_TEXT)
             c.create_text(x, h - 10, text="◆", fill=_TEXT, font=("Arial", 8))
+
+        if self._playhead is not None:
+            px = self._time_to_x(self._playhead)
+            c.create_line(px, 0, px, h, fill=_TEXT, width=2)
+            c.create_oval(px - 4, 2, px + 4, 10, fill=_ACCENT, outline=_TEXT)
 
     def _set_preview_state(self, playing: bool) -> None:
         self._preview_playing = playing
