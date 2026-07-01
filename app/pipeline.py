@@ -113,10 +113,14 @@ def run_pipeline(config: PipelineConfig, progress: ProgressCallback = default_pr
     # Beat analysis overlaps with download/inpaint when beat-sync is enabled.
     beat_info: BeatAnalysis | None = None
     beat_holder: list[BeatAnalysis] = []
+    beat_error: list[BaseException] = []
     beat_thread: threading.Thread | None = None
     if config.beat_sync:
         def _analyze_beats() -> None:
-            beat_holder.append(analyze_audio_beats(config.replacement_audio, progress))
+            try:
+                beat_holder.append(analyze_audio_beats(config.replacement_audio, progress))
+            except BaseException as exc:
+                beat_error.append(exc)
 
         beat_thread = threading.Thread(target=_analyze_beats, daemon=True)
         beat_thread.start()
@@ -167,6 +171,8 @@ def run_pipeline(config: PipelineConfig, progress: ProgressCallback = default_pr
     if config.beat_sync:
         if beat_thread is not None:
             beat_thread.join()
+            if beat_error:
+                raise beat_error[0]
             beat_info = beat_holder[0] if beat_holder else None
         synced = config.work_dir / "beat_synced.mp4"
         sync_video_to_song(

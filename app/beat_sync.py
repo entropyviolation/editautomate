@@ -49,6 +49,9 @@ def analyze_audio_beats(
     if use_cache and cache_key in _BEAT_CACHE:
         return _BEAT_CACHE[cache_key]
 
+    if not audio_path.is_file():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
     import librosa
 
     progress("Analyzing song BPM and beat grid…", 0.72)

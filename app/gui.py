@@ -1676,15 +1676,19 @@ class EditAutomateApp(ctk.CTk):
 
     def _validate(self, job_work_dir: Path | None = None) -> PipelineConfig | None:
         url = self.url_entry.get().strip()
-        audio = Path(self.audio_entry.get().strip())
+        audio_str = self.audio_entry.get().strip()
         output = Path(self.output_entry.get().strip())
 
         use_source = self._selected_source_id is not None
         if not use_source and (not url or "tiktok" not in url.lower()):
             messagebox.showerror("Missing URL", "Enter a valid TikTok URL or pick a library source.")
             return None
-        if not audio.exists():
-            messagebox.showerror("Missing audio", "Choose a replacement song file that exists.")
+        if not audio_str:
+            messagebox.showerror("Missing audio", "Choose a replacement song (Browse or Songs tab → Use in Create).")
+            return None
+        audio = Path(audio_str)
+        if not audio.is_file():
+            messagebox.showerror("Missing audio", f"Replacement song not found or not a file:\n{audio}")
             return None
         ensure_dir(output.parent)
 
